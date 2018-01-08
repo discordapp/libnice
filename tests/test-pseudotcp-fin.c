@@ -1,7 +1,7 @@
 /*
  * This file is part of the Nice GLib ICE library.
  *
- * (C) 2014 Collabora Ltd.
+ * © 2014, 2015 Collabora Ltd.
  *  Contact: Philip Withnall
  *
  * The contents of this file are subject to the Mozilla Public License Version
@@ -269,6 +269,13 @@ expect_syn_received (Data *data)
   expect_segment (data->right, data->right_sent, 0, 7, 7, FLAG_SYN);
 }
 
+static void
+assert_empty_queues (Data *data)
+{
+  g_assert_cmpuint (g_queue_get_length (data->left_sent), ==, 0);
+  g_assert_cmpuint (g_queue_get_length (data->right_sent), ==, 0);
+}
+
 /* Return whether the socket accepted the packet. */
 static gboolean
 forward_segment (GQueue/*<owned GBytes>*/ *from, PseudoTcpSocket *to)
@@ -453,6 +460,8 @@ establish_connection (Data *data)
   expect_ack (data->left,  data->left_sent, 7, 7);
   forward_segment_ltr (data);
   expect_sockets_connected (data);
+
+  assert_empty_queues (data);
 }
 
 /* Helper to close the LHS of a socket pair which has not transmitted any
@@ -638,7 +647,7 @@ pseudotcp_close_normal_recovery1 (void)
   expect_fin (data.left, data.left_sent, 7, 7);
   drop_segment (data.left, data.left_sent);
 
-  increment_time_both (&data, 300);  /* retransmit timeout */
+  increment_time_both (&data, 1100);  /* retransmit timeout */
 
   expect_fin (data.left, data.left_sent, 7, 7);
   forward_segment_ltr (&data);
@@ -673,7 +682,7 @@ pseudotcp_close_normal_recovery2 (void)
 
   expect_ack (data.right, data.right_sent, 7, 8);
   drop_segment (data.right, data.right_sent);
-  increment_time_both (&data, 300);  /* retransmit timeout */
+  increment_time_both (&data, 1100);  /* retransmit timeout */
   expect_fin (data.left, data.left_sent, 7, 7);
   forward_segment_ltr (&data);
   expect_ack (data.right, data.right_sent, 7, 8);
@@ -753,6 +762,76 @@ pseudotcp_close_normal_recovery4 (void)
   data_clear (&data);
 }
 
+/* Check that closing a connection recovers from a data segment being dropped
+ * immediately before the first FIN is sent. Based on: RFC 793, Figure 13. */
+static void
+pseudotcp_close_normal_recovery_data (void)
+{
+  Data data = { 0, };
+
+  /* Establish a connection. */
+  establish_connection (&data);
+
+  /* Send some data from LHS to RHS, but drop the segment. */
+  g_assert_cmpint (pseudo_tcp_socket_send (data.left, "foo", 3), ==, 3);
+  expect_data (data.left, data.left_sent, 7, 7, 3);
+  drop_segment (data.left, data.left_sent);
+
+  assert_empty_queues(&data);
+
+  /* Close the LHS. */
+  g_assert_cmpint (pseudo_tcp_socket_get_available_bytes (data.left), ==, 0);
+  g_assert_cmpint (pseudo_tcp_socket_get_available_bytes (data.right), ==, 0);
+  close_socket (data.left);
+
+  expect_socket_state (data.left, TCP_FIN_WAIT_1);
+  expect_fin (data.left, data.left_sent, 10, 7);
+  forward_segment_ltr (&data);
+
+  expect_socket_state (data.right, TCP_ESTABLISHED);
+  expect_ack (data.right, data.right_sent, 7, 7);
+  forward_segment_rtl (&data);
+
+  expect_socket_state (data.left, TCP_FIN_WAIT_1);
+
+  assert_empty_queues(&data);
+
+  /* Close the RHS. */
+  close_socket (data.right);
+
+  expect_socket_state (data.right, TCP_FIN_WAIT_1);
+
+  expect_fin (data.right, data.right_sent, 7, 7);
+  forward_segment_rtl (&data);
+
+  expect_socket_state (data.left, TCP_CLOSING);
+
+  expect_ack (data.left, data.left_sent, 11, 8);
+  forward_segment_ltr (&data);
+
+  expect_socket_state (data.right, TCP_FIN_WAIT_2);
+
+  expect_data (data.right, data.right_sent, 8, 7, 0);
+  forward_segment_rtl (&data);
+  expect_socket_state (data.left, TCP_CLOSING);
+
+  expect_data (data.left, data.left_sent, 7, 8, 3);
+  forward_segment_ltr (&data);
+  expect_socket_state (data.right, TCP_TIME_WAIT);
+
+  increment_time_both (&data, 100);  /* Delayed ACK */
+
+  expect_ack (data.right, data.right_sent, 8, 11);
+  forward_segment_rtl (&data);
+  expect_socket_state (data.left, TCP_TIME_WAIT);
+
+  increment_time_both (&data, 10);  /* TIME-WAIT */
+
+  expect_sockets_closed (&data);
+
+  data_clear (&data);
+}
+
 /* Check that if both FIN segments from a simultaneous FIN handshake are
  * dropped, the handshake recovers and completes successfully.
  * See: RFC 793, Figure 14. */
@@ -773,7 +852,7 @@ pseudotcp_close_simultaneous_recovery1 (void)
   drop_segment (data.left, data.left_sent);
   drop_segment (data.right, data.right_sent);
 
-  increment_time_both (&data, 400);  /* retransmit timeout */
+  increment_time_both (&data, 1200);  /* retransmit timeout */
 
   expect_fin (data.left, data.left_sent, 7, 7);
   expect_fin (data.right, data.right_sent, 7, 7);
@@ -817,7 +896,7 @@ pseudotcp_close_simultaneous_recovery2 (void)
   drop_segment (data.left, data.left_sent);
   drop_segment (data.right, data.right_sent);
 
-  increment_time_both (&data, 400);  /* retransmit timeout */
+  increment_time_both (&data, 1200);  /* retransmit timeout */
 
   expect_fin (data.left, data.left_sent, 7, 8);
   expect_fin (data.right, data.right_sent, 7, 8);
@@ -977,10 +1056,13 @@ pseudotcp_close_rst_afterwards (void)
 
   /* Close the LHS. */
   g_assert_cmpint (pseudo_tcp_socket_get_available_bytes (data.left), ==, 0);
+  pseudo_tcp_socket_close (data.left, TRUE);
   close_socket (data.left);
 
-  expect_fin (data.left, data.left_sent, 7, 7);
+  expect_rst (data.left, data.left_sent, 7, 7);
   drop_segment (data.left, data.left_sent);  /* just to get it out of the way */
+
+  assert_empty_queues(&data);
 
   /* Send some data from RHS to LHS, which should result in an RST. */
   g_assert_cmpint (pseudo_tcp_socket_send (data.right, "foo", 3), ==, 3);
@@ -1059,6 +1141,63 @@ pseudotcp_compatibility (void)
   data_clear (&data);
 }
 
+
+/* Check that after receiving a FIN, queued data can still be read */
+static void
+pseudotcp_close_recv_queued (void)
+{
+  Data data = { 0, };
+  guint8 buf[100];
+
+  /* Establish a connection. */
+  establish_connection (&data);
+
+  g_assert_cmpint (pseudo_tcp_socket_get_available_bytes (data.left), ==, 0);
+  g_assert_cmpint (pseudo_tcp_socket_get_available_bytes (data.right), ==, 0);
+  g_assert_cmpint (pseudo_tcp_socket_get_available_send_space (data.right), >,
+      0);
+  g_assert_cmpint (pseudo_tcp_socket_get_available_send_space (data.left), >,
+      0);
+
+  g_assert_cmpint (pseudo_tcp_socket_send (data.left, "foo", 3), ==, 3);
+  expect_data (data.left, data.left_sent, 7, 7, 3);
+  forward_segment_ltr (&data);
+
+  increment_time_both (&data, 100);  /* Delayed ACK */
+  expect_ack (data.right, data.right_sent, 7, 10);
+  forward_segment_rtl (&data);
+
+  close_socket (data.left);
+  expect_fin (data.left, data.left_sent, 10, 7);
+  forward_segment_ltr (&data);
+
+  expect_socket_state (data.left, TCP_FIN_WAIT_1);
+  expect_socket_state (data.right, TCP_CLOSE_WAIT);
+
+  g_assert_cmpint (pseudo_tcp_socket_get_available_bytes (data.left), ==, 0);
+  g_assert_cmpint (pseudo_tcp_socket_get_available_send_space (data.left), ==,
+      0);
+
+  expect_ack (data.right, data.right_sent, 7, 11);
+  forward_segment_rtl (&data);
+
+  expect_socket_state (data.left, TCP_FIN_WAIT_2);
+
+
+  g_assert_cmpint (pseudo_tcp_socket_get_available_bytes (data.right), ==, 3);
+
+  g_assert_cmpint (pseudo_tcp_socket_get_available_send_space (data.right), >,
+      0);
+
+  /* Check that the data can be read */
+  g_assert_cmpint (pseudo_tcp_socket_recv (data.right, (char *) buf, sizeof (buf)), ==, 3);
+
+  /* Now the socket should be empty */
+  g_assert_cmpint (pseudo_tcp_socket_recv (data.right, (char *) buf, sizeof (buf)), ==, 0);
+
+  data_clear (&data);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -1109,6 +1248,8 @@ main (int argc, char *argv[])
       pseudotcp_close_normal_recovery3);
   g_test_add_func ("/pseudotcp/close/normal/recovery4",
       pseudotcp_close_normal_recovery4);
+  g_test_add_func ("/pseudotcp/close/normal/recovery-data",
+      pseudotcp_close_normal_recovery_data);
   g_test_add_func ("/pseudotcp/close/simultaneous/recovery1",
       pseudotcp_close_simultaneous_recovery1);
   g_test_add_func ("/pseudotcp/close/simultaneous/recovery2",
@@ -1124,6 +1265,9 @@ main (int argc, char *argv[])
       pseudotcp_close_pending_received);
   g_test_add_func ("/pseudotcp/close/rst-afterwards",
       pseudotcp_close_rst_afterwards);
+
+  g_test_add_func ("/pseudotcp/close/recv-queued",
+      pseudotcp_close_recv_queued);
 
   g_test_add_func ("/pseudotcp/compatibility",
       pseudotcp_compatibility);

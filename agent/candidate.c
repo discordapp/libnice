@@ -52,6 +52,7 @@
 
 #include "agent.h"
 #include "component.h"
+#include "interfaces.h"
 
 G_DEFINE_BOXED_TYPE (NiceCandidate, nice_candidate, nice_candidate_copy,
     nice_candidate_free);
@@ -144,6 +145,43 @@ nice_candidate_ice_local_preference_full (guint direction_preference,
       other_preference);
 }
 
+static guint8
+nice_candidate_ip_local_preference (const NiceCandidate *candidate)
+{
+  guint8 preference = 0;
+  gchar ip_string[INET6_ADDRSTRLEN];
+  GList/*<owned gchar*>*/ *ips = NULL;
+  GList/*<unowned gchar*>*/ *iter;
+
+  /* Ensure otherwise identical host candidates with only different IP addresses
+   * (multihomed host) get assigned different priorities. Position of the IP in
+   * the list obtained from nice_interfaces_get_local_ips() serves here as the
+   * distinguishing value of other_preference. Reflexive and relayed candidates
+   * are likewise differentiated by their base address.
+   *
+   * This is required by RFC 5245 Section 4.1.2.1:
+   *   https://tools.ietf.org/html/rfc5245#section-4.1.2.1
+   */
+  if (candidate->type == NICE_CANDIDATE_TYPE_HOST) {
+    nice_address_to_string (&candidate->addr, ip_string);
+  } else {
+    nice_address_to_string (&candidate->base_addr, ip_string);
+  }
+
+  ips = nice_interfaces_get_local_ips (TRUE);
+
+  for (iter = ips; iter; iter = g_list_next (iter)) {
+    if (g_strcmp0 (ip_string, iter->data) == 0) {
+      break;
+    }
+    ++preference;
+  }
+
+  g_list_free_full (ips, g_free);
+
+  return preference;
+}
+
 static guint16
 nice_candidate_ice_local_preference (const NiceCandidate *candidate)
 {
@@ -153,21 +191,21 @@ nice_candidate_ice_local_preference (const NiceCandidate *candidate)
     {
       case NICE_CANDIDATE_TRANSPORT_TCP_ACTIVE:
         if (candidate->type == NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE ||
-            candidate->type == NICE_CANDIDATE_TYPE_PREF_NAT_ASSISTED)
+            candidate->type == NICE_CANDIDATE_TYPE_HOST)
           direction_preference = 4;
         else
           direction_preference = 6;
         break;
       case NICE_CANDIDATE_TRANSPORT_TCP_PASSIVE:
         if (candidate->type == NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE ||
-            candidate->type == NICE_CANDIDATE_TYPE_PREF_NAT_ASSISTED)
+            candidate->type == NICE_CANDIDATE_TYPE_HOST)
           direction_preference = 2;
         else
           direction_preference = 4;
         break;
       case NICE_CANDIDATE_TRANSPORT_TCP_SO:
         if (candidate->type == NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE ||
-            candidate->type == NICE_CANDIDATE_TYPE_PREF_NAT_ASSISTED)
+            candidate->type == NICE_CANDIDATE_TYPE_HOST)
           direction_preference = 6;
         else
           direction_preference = 2;
@@ -178,7 +216,8 @@ nice_candidate_ice_local_preference (const NiceCandidate *candidate)
         break;
     }
 
-  return nice_candidate_ice_local_preference_full (direction_preference, 1);
+  return nice_candidate_ice_local_preference_full (direction_preference,
+      nice_candidate_ip_local_preference (candidate));
 }
 
 static guint32
@@ -214,7 +253,7 @@ nice_candidate_ms_ice_local_preference (const NiceCandidate *candidate)
     }
 
   return nice_candidate_ms_ice_local_preference_full(transport_preference,
-      direction_preference, 0);
+      direction_preference, nice_candidate_ip_local_preference (candidate));
 }
 
 static guint8
@@ -238,7 +277,10 @@ nice_candidate_ice_type_preference (const NiceCandidate *candidate,
         type_preference = NICE_CANDIDATE_TYPE_PREF_SERVER_REFLEXIVE;
       break;
     case NICE_CANDIDATE_TYPE_RELAYED:
-      type_preference = NICE_CANDIDATE_TYPE_PREF_RELAYED;
+      if (candidate->turn->type == NICE_RELAY_TYPE_TURN_UDP)
+        type_preference = NICE_CANDIDATE_TYPE_PREF_RELAYED_UDP;
+      else
+        type_preference = NICE_CANDIDATE_TYPE_PREF_RELAYED;
       break;
     default:
       type_preference = 0;

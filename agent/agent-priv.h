@@ -119,7 +119,6 @@ struct _NiceAgent
   GObject parent;                 /* gobject pointer */
 
   gboolean full_mode;             /* property: full-mode */
-  GTimeVal next_check_tv;         /* property: next conncheck timestamp */
   gchar *stun_server_ip;          /* property: STUN server IP */
   guint stun_server_port;         /* property: STUN server port */
   gchar *proxy_ip;                /* property: Proxy server IP */
@@ -130,6 +129,7 @@ struct _NiceAgent
   gboolean controlling_mode;      /* property: controlling-mode */
   guint timer_ta;                 /* property: timer Ta */
   guint max_conn_checks;          /* property: max connectivity checks */
+  gboolean force_relay;           /* property: force relay */
 
   GSList *local_addresses;        /* list of NiceAddresses for local
 				     interfaces */
@@ -139,6 +139,7 @@ struct _NiceAgent
   guint next_stream_id;           /* id of next created candidate */
   NiceRNG *rng;                   /* random number generator */
   GSList *discovery_list;         /* list of CandidateDiscovery items */
+  GSList *triggered_check_queue;  /* pairs in the triggered check list */
   guint discovery_unsched_items;  /* number of discovery items unscheduled */
   GSource *discovery_timer_source; /* source of discovery timer */
   GSource *conncheck_timer_source; /* source of conncheck timer */
@@ -171,10 +172,10 @@ agent_find_component (
   NiceAgent *agent,
   guint stream_id,
   guint component_id,
-  Stream **stream,
-  Component **component);
+  NiceStream **stream,
+  NiceComponent **component) G_GNUC_WARN_UNUSED_RESULT;
 
-Stream *agent_find_stream (NiceAgent *agent, guint stream_id);
+NiceStream *agent_find_stream (NiceAgent *agent, guint stream_id);
 
 void agent_gathering_done (NiceAgent *agent);
 void agent_signal_gathering_done (NiceAgent *agent);
@@ -202,7 +203,7 @@ void agent_signal_new_candidate (
 
 void agent_signal_new_remote_candidate (NiceAgent *agent, NiceCandidate *candidate);
 
-void agent_signal_initial_binding_request_received (NiceAgent *agent, Stream *stream);
+void agent_signal_initial_binding_request_received (NiceAgent *agent, NiceStream *stream);
 
 guint64 agent_candidate_pair_priority (NiceAgent *agent, NiceCandidate *local, NiceCandidate *remote);
 
@@ -219,6 +220,8 @@ void agent_remove_local_candidate (NiceAgent *agent,
 void nice_agent_init_stun_agent (NiceAgent *agent, StunAgent *stun_agent);
 
 void _priv_set_socket_tos (NiceAgent *agent, NiceSocket *sock, gint tos);
+
+void _tcp_sock_is_writable (NiceSocket *sock, gpointer user_data);
 
 gboolean
 component_io_cb (
@@ -274,10 +277,14 @@ void nice_debug_init (void);
 
 #ifdef NDEBUG
 static inline gboolean nice_debug_is_enabled (void) { return FALSE; }
+static inline gboolean nice_debug_is_verbose (void) { return FALSE; }
 static inline void nice_debug (const char *fmt, ...) { }
+static inline void nice_debug_verbose (const char *fmt, ...) { }
 #else
 gboolean nice_debug_is_enabled (void);
+gboolean nice_debug_is_verbose (void);
 void nice_debug (const char *fmt, ...) G_GNUC_PRINTF (1, 2);
+void nice_debug_verbose (const char *fmt, ...) G_GNUC_PRINTF (1, 2);
 #endif
 
 #endif /*_NICE_AGENT_PRIV_H */

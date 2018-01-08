@@ -116,6 +116,7 @@ static gboolean socket_is_reliable (NiceSocket *sock);
 static gboolean socket_can_send (NiceSocket *sock, NiceAddress *addr);
 static void socket_set_writable_callback (NiceSocket *sock,
     NiceSocketWritableCb callback, gpointer user_data);
+static gboolean socket_is_based_on (NiceSocket *sock, NiceSocket *other);
 
 NiceSocket *
 nice_pseudossl_socket_new (NiceSocket *base_socket,
@@ -152,6 +153,7 @@ nice_pseudossl_socket_new (NiceSocket *base_socket,
   sock->is_reliable = socket_is_reliable;
   sock->can_send = socket_can_send;
   sock->set_writable_callback = socket_set_writable_callback;
+  sock->is_based_on = socket_is_based_on;
   sock->close = socket_close;
 
   /* We send 'to' NULL because it will always be to an already connected
@@ -204,9 +206,8 @@ socket_recv_messages (NiceSocket *sock,
 {
   PseudoSSLPriv *priv = sock->priv;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return 0;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   if (priv->handshaken) {
     if (priv->base_socket) {
@@ -256,9 +257,8 @@ socket_send_messages (NiceSocket *sock, const NiceAddress *to,
 {
   PseudoSSLPriv *priv = sock->priv;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return -1;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   if (priv->handshaken) {
     /* Fast path: pass directly through to the base socket once the handshake is
@@ -318,4 +318,13 @@ socket_set_writable_callback (NiceSocket *sock,
   PseudoSSLPriv *priv = sock->priv;
 
   nice_socket_set_writable_callback (priv->base_socket, callback, user_data);
+}
+
+static gboolean
+socket_is_based_on (NiceSocket *sock, NiceSocket *other)
+{
+  PseudoSSLPriv *priv = sock->priv;
+
+  return (sock == other) ||
+      (priv && nice_socket_is_based_on (priv->base_socket, other));
 }

@@ -42,7 +42,7 @@
 
 #include <glib.h>
 
-typedef struct _Component Component;
+typedef struct _NiceComponent NiceComponent;
 
 #include "agent.h"
 #include "agent-priv.h"
@@ -83,6 +83,7 @@ struct _CandidatePair
   NiceCandidate *local;
   NiceCandidate *remote;
   guint64 priority;           /* candidate pair priority */
+  guint32 prflx_priority;
   CandidatePairKeepalive keepalive;
 };
 
@@ -110,7 +111,7 @@ incoming_check_free (IncomingCheck *icheck);
 typedef struct {
   NiceSocket *socket;
   GSource *source;
-  Component *component;
+  NiceComponent *component;
 } SocketSource;
 
 
@@ -137,9 +138,22 @@ io_callback_data_new (const guint8 *buf, gsize buf_len);
 void
 io_callback_data_free (IOCallbackData *data);
 
+#define NICE_TYPE_COMPONENT nice_component_get_type()
+#define NICE_COMPONENT(obj) \
+  (G_TYPE_CHECK_INSTANCE_CAST ((obj), NICE_TYPE_COMPONENT, NiceComponent))
+#define NICE_COMPONENT_CLASS(klass) \
+  (G_TYPE_CHECK_CLASS_CAST ((klass), NICE_TYPE_COMPONENT, NiceComponentClass))
+#define NICE_IS_COMPONENT(obj) \
+  (G_TYPE_CHECK_INSTANCE_TYPE ((obj), NICE_TYPE_COMPONENT))
+#define NICE_IS_COMPONENT_CLASS(klass) \
+  (G_TYPE_CHECK_CLASS_TYPE ((klass), NICE_TYPE_COMPONENT))
+#define NICE_COMPONENT_GET_CLASS(obj) \
+  (G_TYPE_INSTANCE_GET_CLASS ((obj), NICE_TYPE_COMPONENT, NiceComponentClass))
 
-struct _Component
-{
+struct _NiceComponent {
+  /*< private >*/
+  GObject parent;
+
   NiceComponentType type;
   guint id;                    /* component id */
   NiceComponentState state;
@@ -186,8 +200,8 @@ struct _Component
 
   NiceAgent *agent;  /* unowned, immutable: can be accessed without holding the
                       * agent lock */
-  Stream *stream;  /* unowned, immutable: can be accessed without holding the
-                    * agent lock */
+  NiceStream *stream;  /* unowned, immutable: can be accessed without holding
+                        * the agent lock */
 
   StunAgent stun_agent; /* This stun agent is used to validate all stun requests */
 
@@ -212,63 +226,69 @@ struct _Component
   GQueue queued_tcp_packets;
 };
 
-Component *
-component_new (guint component_id, NiceAgent *agent, Stream *stream);
+typedef struct {
+  GObjectClass parent_class;
+} NiceComponentClass;
+
+GType nice_component_get_type (void);
+
+NiceComponent *
+nice_component_new (guint component_id, NiceAgent *agent, NiceStream *stream);
 
 void
-component_close (Component *cmp);
-
-void
-component_free (Component *cmp);
+nice_component_close (NiceComponent *component);
 
 gboolean
-component_find_pair (Component *cmp, NiceAgent *agent, const gchar *lfoundation, const gchar *rfoundation, CandidatePair *pair);
+nice_component_find_pair (NiceComponent *component, NiceAgent *agent,
+    const gchar *lfoundation, const gchar *rfoundation, CandidatePair *pair);
 
 void
-component_restart (Component *cmp);
+nice_component_restart (NiceComponent *component);
 
 void
-component_update_selected_pair (Component *component, const CandidatePair *pair);
+nice_component_update_selected_pair (NiceComponent *component,
+    const CandidatePair *pair);
 
 NiceCandidate *
-component_find_remote_candidate (const Component *component, const NiceAddress *addr, NiceCandidateTransport transport);
+nice_component_find_remote_candidate (NiceComponent *component,
+    const NiceAddress *addr, NiceCandidateTransport transport);
 
 NiceCandidate *
-component_set_selected_remote_candidate (NiceAgent *agent, Component *component,
-    NiceCandidate *candidate);
+nice_component_set_selected_remote_candidate (NiceComponent *component,
+    NiceAgent *agent, NiceCandidate *candidate);
 
 void
-component_attach_socket (Component *component, NiceSocket *nsocket);
+nice_component_attach_socket (NiceComponent *component, NiceSocket *nsocket);
+
 void
-component_detach_socket (Component *component, NiceSocket *nsocket);
+nice_component_remove_socket (NiceComponent *component, NiceSocket *nsocket);
 void
-component_detach_all_sockets (Component *component);
+nice_component_detach_all_sockets (NiceComponent *component);
+
 void
-component_free_socket_sources (Component *component);
+nice_component_free_socket_sources (NiceComponent *component);
 
 GSource *
-component_input_source_new (NiceAgent *agent, guint stream_id,
+nice_component_input_source_new (NiceAgent *agent, guint stream_id,
     guint component_id, GPollableInputStream *pollable_istream,
     GCancellable *cancellable);
 
 GMainContext *
-component_dup_io_context (Component *component);
+nice_component_dup_io_context (NiceComponent *component);
 void
-component_set_io_context (Component *component, GMainContext *context);
+nice_component_set_io_context (NiceComponent *component, GMainContext *context);
 void
-component_set_io_callback (Component *component,
+nice_component_set_io_callback (NiceComponent *component,
     NiceAgentRecvFunc func, gpointer user_data,
     NiceInputMessage *recv_messages, guint n_recv_messages,
     GError **error);
 void
-component_emit_io_callback (Component *component,
+nice_component_emit_io_callback (NiceComponent *component,
     const guint8 *buf, gsize buf_len);
-
 gboolean
-component_has_io_callback (Component *component);
-
+nice_component_has_io_callback (NiceComponent *component);
 void
-component_clean_turn_servers (Component *component);
+nice_component_clean_turn_servers (NiceComponent *component);
 
 
 TurnServer *

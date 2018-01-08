@@ -205,9 +205,10 @@ gst_nice_src_read_callback (NiceAgent *agent,
   buffer = gst_buffer_new_and_alloc (len);
   memcpy (GST_BUFFER_DATA (buffer), buf, len);
 #endif
+  GST_OBJECT_LOCK (nicesrc);
   g_queue_push_tail (nicesrc->outbufs, buffer);
-
   g_main_loop_quit (nicesrc->mainloop);
+  GST_OBJECT_UNLOCK (nicesrc);
 }
 
 static gboolean
@@ -285,12 +286,15 @@ gst_nice_src_create (
     return GST_FLOW_WRONG_STATE;
 #endif
   }
-  GST_OBJECT_UNLOCK (basesrc);
-
-  if (g_queue_is_empty (nicesrc->outbufs))
+  if (g_queue_is_empty (nicesrc->outbufs)) {
+    GST_OBJECT_UNLOCK (basesrc);
     g_main_loop_run (nicesrc->mainloop);
+    GST_OBJECT_LOCK (basesrc);
+  }
 
   *buffer = g_queue_pop_head (nicesrc->outbufs);
+  GST_OBJECT_UNLOCK (basesrc);
+
   if (*buffer != NULL) {
     GST_LOG_OBJECT (nicesrc, "Got buffer, pushing");
     return GST_FLOW_OK;
@@ -322,8 +326,10 @@ gst_nice_src_dispose (GObject *object)
     g_main_context_unref (src->mainctx);
   src->mainctx = NULL;
 
-  if (src->outbufs)
+  if (src->outbufs) {
+    g_queue_foreach (src->outbufs, (GFunc) gst_buffer_unref, NULL);
     g_queue_free (src->outbufs);
+  }
   src->outbufs = NULL;
 
   G_OBJECT_CLASS (gst_nice_src_parent_class)->dispose (object);
@@ -401,32 +407,57 @@ gst_nice_src_change_state (GstElement * element, GstStateChange transition)
 
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
-      if (src->agent == NULL || src->stream_id == 0 || src->component_id == 0)
+      if (src->agent == NULL)
         {
           GST_ERROR_OBJECT (element,
               "Trying to start Nice source without an agent set");
           return GST_STATE_CHANGE_FAILURE;
         }
-      else
-        {
-          nice_agent_attach_recv (src->agent, src->stream_id, src->component_id,
-              src->mainctx, gst_nice_src_read_callback, (gpointer) src);
-        }
+      else if (src->stream_id == 0)
+          {
+            GST_ERROR_OBJECT (element,
+                "Trying to start Nice source without a stream set");
+            return GST_STATE_CHANGE_FAILURE;
+          }
+      else if (src->component_id == 0)
+          {
+            GST_ERROR_OBJECT (element,
+                "Trying to start Nice source without a component set");
+            return GST_STATE_CHANGE_FAILURE;
+          }
       break;
-    case GST_STATE_CHANGE_READY_TO_NULL:
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
       nice_agent_attach_recv (src->agent, src->stream_id, src->component_id,
           src->mainctx, NULL, NULL);
+      GST_OBJECT_LOCK (src);
+      g_queue_foreach (src->outbufs, (GFunc) gst_buffer_unref, NULL);
+      g_queue_clear (src->outbufs);
+      GST_OBJECT_UNLOCK (src);
       break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
-    case GST_STATE_CHANGE_PAUSED_TO_READY:
+    case GST_STATE_CHANGE_READY_TO_NULL:
     default:
       break;
   }
 
   ret = GST_ELEMENT_CLASS (gst_nice_src_parent_class)->change_state (element,
       transition);
+
+  switch (transition) {
+    case GST_STATE_CHANGE_READY_TO_PAUSED:
+      nice_agent_attach_recv (src->agent, src->stream_id, src->component_id,
+          src->mainctx, gst_nice_src_read_callback, (gpointer) src);
+      break;
+    case GST_STATE_CHANGE_NULL_TO_READY:
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+    case GST_STATE_CHANGE_READY_TO_NULL:
+    default:
+      break;
+  }
 
   return ret;
 }

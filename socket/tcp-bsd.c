@@ -54,6 +54,11 @@
 #include <unistd.h>
 #endif
 
+/* FIXME: This should be defined in gio/gnetworking.h, which we should include;
+ * but we cannot do that without refactoring.
+ * (See: https://phabricator.freedesktop.org/D230). */
+#define TCP_NODELAY 1
+
 typedef struct {
   NiceAddress remote_addr;
   GQueue send_queue;
@@ -168,6 +173,9 @@ nice_tcp_bsd_socket_new (GMainContext *ctx, NiceAddress *local_addr,
   /* GSocket: All socket file descriptors are set to be close-on-exec. */
   g_socket_set_blocking (gsock, false);
 
+  /* setting TCP_NODELAY to TRUE in order to avoid packet batching */
+  g_socket_set_option (gsock, IPPROTO_TCP, TCP_NODELAY, TRUE, NULL);
+
   gret = g_socket_connect (gsock, gaddr, NULL, &gerr);
   g_object_unref (gaddr);
 
@@ -229,9 +237,8 @@ socket_recv_messages (NiceSocket *sock,
   TcpPriv *priv = sock->priv;
   guint i;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return 0;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   /* Don't try to access the socket if it had an error */
   if (priv->error)
@@ -283,9 +290,8 @@ socket_send_message (NiceSocket *sock,
   GError *gerr = NULL;
   gsize message_len;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return -1;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   /* Don't try to access the socket if it had an error, otherwise we risk a
    * crash with SIGPIPE (Broken pipe) */
@@ -344,9 +350,8 @@ socket_send_messages (NiceSocket *sock, const NiceAddress *to,
 {
   guint i;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return -1;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   for (i = 0; i < n_messages; i++) {
     const NiceOutputMessage *message = &messages[i];

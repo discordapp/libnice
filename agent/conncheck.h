@@ -87,26 +87,30 @@ struct _CandidateCheckPair
   gboolean nominated;
   gboolean controlling;
   gboolean timer_restarted;
+  gboolean valid;
   guint64 priority;
+  guint32 prflx_priority;
   GTimeVal next_tick;       /* next tick timestamp */
   StunTimer timer;
   uint8_t stun_buffer[STUN_MAX_MESSAGE_SIZE_IPV6];
   StunMessage stun_message;
 };
 
-int conn_check_add_for_candidate (NiceAgent *agent, guint stream_id, Component *component, NiceCandidate *remote);
-int conn_check_add_for_local_candidate (NiceAgent *agent, guint stream_id, Component *component, NiceCandidate *local);
-gboolean conn_check_add_for_candidate_pair (NiceAgent *agent, guint stream_id, Component *component, NiceCandidate *local, NiceCandidate *remote);
+int conn_check_add_for_candidate (NiceAgent *agent, guint stream_id, NiceComponent *component, NiceCandidate *remote);
+int conn_check_add_for_local_candidate (NiceAgent *agent, guint stream_id, NiceComponent *component, NiceCandidate *local);
+gboolean conn_check_add_for_candidate_pair (NiceAgent *agent, guint stream_id, NiceComponent *component, NiceCandidate *local, NiceCandidate *remote);
 void conn_check_free (NiceAgent *agent);
-gboolean conn_check_schedule_next (NiceAgent *agent);
+void conn_check_schedule_next (NiceAgent *agent);
 int conn_check_send (NiceAgent *agent, CandidateCheckPair *pair);
-void conn_check_prune_stream (NiceAgent *agent, Stream *stream);
-gboolean conn_check_handle_inbound_stun (NiceAgent *agent, Stream *stream, Component *component, NiceSocket *udp_socket, const NiceAddress *from, gchar *buf, guint len);
+void conn_check_prune_stream (NiceAgent *agent, NiceStream *stream);
+gboolean conn_check_handle_inbound_stun (NiceAgent *agent, NiceStream *stream, NiceComponent *component, NiceSocket *udp_socket, const NiceAddress *from, gchar *buf, guint len);
 gint conn_check_compare (const CandidateCheckPair *a, const CandidateCheckPair *b);
-void conn_check_remote_candidates_set(NiceAgent *agent);
+void conn_check_remote_candidates_set(NiceAgent *agent, NiceStream *stream, NiceComponent *component);
 NiceCandidateTransport conn_check_match_transport (NiceCandidateTransport transport);
 void
-conn_check_prune_socket (NiceAgent *agent, Stream *stream, Component *component,
+conn_check_prune_socket (NiceAgent *agent, NiceStream *stream, NiceComponent *component,
     NiceSocket *sock);
+
+guint32 ensure_unique_priority (NiceComponent *component, guint32 priority);
 
 #endif /*_NICE_CONNCHECK_H */
