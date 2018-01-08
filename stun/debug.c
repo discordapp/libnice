@@ -46,7 +46,7 @@
 #include "debug.h"
 
 
-static int debug_enabled = 1;
+static int debug_enabled = 0;
 
 void stun_debug_enable (void) {
   debug_enabled = 1;
@@ -55,6 +55,15 @@ void stun_debug_disable (void) {
   debug_enabled = 0;
 }
 
+#if     __GNUC__ > 2 || (__GNUC__ == 2 && __GNUC_MINOR__ > 4)
+#define GNUC_PRINTF(format_idx, arg_idx) \
+  __attribute__((__format__ (__printf__, format_idx, arg_idx)))
+#else
+#define GNUC_PRINTF( format_idx, arg_idx)
+#endif
+
+static void
+default_handler (const char *format, va_list ap) GNUC_PRINTF (1, 0);
 
 static void
 default_handler (const char *format, va_list ap)
@@ -79,19 +88,29 @@ void stun_debug_bytes (const char *prefix, const void *data, size_t len)
 {
   size_t i;
   size_t prefix_len = strlen (prefix);
-  char bytes[prefix_len + 2 + (len * 2) + 1];
+  char *bytes;
+  char *j;
+  unsigned char k;
+  const char *hex = "0123456789abcdef";
 
   if (!debug_enabled)
     return;
 
+  bytes = malloc (prefix_len + 2 + (len * 2) + 1);
   bytes[0] = 0;
   strcpy (bytes, prefix);
   strcpy (bytes + prefix_len, "0x");
 
-  for (i = 0; i < len; i++)
-    snprintf (bytes + prefix_len + 2 + (i * 2), 3, "%02x", ((const unsigned char *)data)[i]);
-
+  j = bytes + prefix_len + 2;
+  for (i = 0; i < len; i++) {
+    k = ((const unsigned char *)data)[i];
+    j[0] = hex[(k & 0xf0) >> 4];
+    j[1] = hex[k & 0xf];
+    j = j + 2;
+  }
+  j[0] = 0;
   stun_debug ("%s", bytes);
+  free (bytes);
 }
 
 

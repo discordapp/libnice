@@ -73,7 +73,7 @@ stun_usage_ice_conncheck_create (StunAgent *agent, StunMessage *msg,
   stun_agent_init_request (agent, msg, buffer, buffer_len, STUN_BINDING);
 
   if (compatibility == STUN_USAGE_ICE_COMPATIBILITY_RFC5245 ||
-      compatibility == STUN_USAGE_ICE_COMPATIBILITY_WLM2009) {
+      compatibility == STUN_USAGE_ICE_COMPATIBILITY_MSICE2) {
     if (cand_use)
     {
       val = stun_message_append_flag (msg, STUN_ATTRIBUTE_USE_CANDIDATE);
@@ -100,7 +100,7 @@ stun_usage_ice_conncheck_create (StunAgent *agent, StunMessage *msg,
       return 0;
   }
 
-  if (compatibility == STUN_USAGE_ICE_COMPATIBILITY_WLM2009) {
+  if (compatibility == STUN_USAGE_ICE_COMPATIBILITY_MSICE2) {
     size_t identifier_len = strlen(candidate_identifier);
     size_t attribute_len = identifier_len;
     int modulo4 = identifier_len % 4;
@@ -122,6 +122,12 @@ stun_usage_ice_conncheck_create (StunAgent *agent, StunMessage *msg,
 
     if (val != STUN_MESSAGE_RETURN_SUCCESS)
 		return 0;
+
+    val = stun_message_append32 (msg,
+        STUN_ATTRIBUTE_MS_IMPLEMENTATION_VERSION, 2);
+
+    if (val != STUN_MESSAGE_RETURN_SUCCESS)
+      return 0;
   }
 
   return stun_agent_finish_message (agent, msg, password, password_len);
@@ -265,9 +271,17 @@ stun_usage_ice_conncheck_create_reply (StunAgent *agent, StunMessage *req,
   if (stun_message_find64 (req, *control ? STUN_ATTRIBUTE_ICE_CONTROLLING
           : STUN_ATTRIBUTE_ICE_CONTROLLED, &q) == STUN_MESSAGE_RETURN_SUCCESS)
   {
+    /* we have the ice-controlling/controlled attribute,
+     * and there's a role conflict
+     */
     stun_debug ("STUN Role Conflict detected:");
 
-    if (tie < q)
+    /* According to ICE RFC 5245, section 7.2.1.1, we consider the four
+     * possible cases when a role conflict is detected: two cases are
+     * resolved by switching role locally, and the two other cases are
+     * handled by responding with a STUN error.
+     */
+    if ((tie < q && *control) || (tie >= q && !*control))
     {
       stun_debug (" switching role from \"controll%s\" to \"controll%s\"",
            *control ? "ing" : "ed", *control ? "ed" : "ing");
@@ -279,10 +293,21 @@ stun_usage_ice_conncheck_create_reply (StunAgent *agent, StunMessage *req,
       stun_debug (" staying \"controll%s\" (sending error)",
            *control ? "ing" : "ed");
       err (STUN_ERROR_ROLE_CONFLICT);
-      return STUN_USAGE_ICE_RETURN_SUCCESS;
+      return STUN_USAGE_ICE_RETURN_ROLE_CONFLICT;
     }
   } else {
-    stun_debug ("STUN Role not specified by peer!");
+    if (stun_message_find64 (req, *control ? STUN_ATTRIBUTE_ICE_CONTROLLED
+            : STUN_ATTRIBUTE_ICE_CONTROLLING, &q) != STUN_MESSAGE_RETURN_SUCCESS)
+    {
+      /* we don't have the expected ice-controlling/controlled
+       * attribute
+       */
+      if (compatibility == STUN_USAGE_ICE_COMPATIBILITY_RFC5245 ||
+          compatibility == STUN_USAGE_ICE_COMPATIBILITY_MSICE2)
+      {
+        stun_debug ("STUN Role not specified by peer!");
+      }
+    }
   }
 
   if (stun_agent_init_response (agent, msg, buf, len, req) == FALSE) {
@@ -325,7 +350,15 @@ stun_usage_ice_conncheck_create_reply (StunAgent *agent, StunMessage *req,
     goto failure;
   }
 
+  if (compatibility == STUN_USAGE_ICE_COMPATIBILITY_MSICE2) {
+    val = stun_message_append32 (msg,
+        STUN_ATTRIBUTE_MS_IMPLEMENTATION_VERSION, 2);
 
+    if (val != STUN_MESSAGE_RETURN_SUCCESS) {
+      stun_debug ("Error appending implementation version: %d", val);
+      goto failure;
+    }
+  }
 
   /* the stun agent will automatically use the password of the request */
   len = stun_agent_finish_message (agent, msg, NULL, 0);

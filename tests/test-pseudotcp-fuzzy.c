@@ -98,7 +98,7 @@ guint32 right_stream_pos = 0;
 /* Configuration options. */
 gint64 seed = 0;
 guint32 fuzz_start_pos = 1;  /* bytes into stream payload; after the SYN-ACKs */
-guint n_changes_lambda = 2;  /* lambda parameter for a Poisson distribution
+guint n_changes_lambda = 1;  /* lambda parameter for a Poisson distribution
                               * controlling the number of mutations made to each
                               * packet */
 
@@ -270,7 +270,7 @@ fuzz_packet (guint8 *buf, guint32 len, guint32 stream_pos)
 {
   guint32 i;
   guint n_changes;
-#define TCP_HEADER_LENGTH 32 /* bytes; or thereabouts (include some options) */
+#define HEADER_LENGTH 24 /* bytes; or thereabouts (include some options) */
 
   /* Do we want to fuzz this packet? */
   if (stream_pos < fuzz_start_pos) {
@@ -285,7 +285,7 @@ fuzz_packet (guint8 *buf, guint32 len, guint32 stream_pos)
       n_changes, stream_pos);
 
   for (i = 0; i < n_changes; i++) {
-    guint32 pos = g_rand_int_range (prng, 0, MIN (len, TCP_HEADER_LENGTH));
+    guint32 pos = g_rand_int_range (prng, 0, MIN (len, HEADER_LENGTH));
     g_debug (" • Changing byte %u.", stream_pos + pos);
     buf[pos] = g_rand_int_range (prng, 0, G_MAXUINT8 + 1);
   }
@@ -395,7 +395,6 @@ int main (int argc, char *argv[])
   GError *error = NULL;
 
   setlocale (LC_ALL, "");
-  g_type_init ();
 
   /* Configuration. */
   context = g_option_context_new ("— fuzz-test the pseudotcp socket");

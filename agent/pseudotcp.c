@@ -77,8 +77,19 @@
 #include "pseudotcp.h"
 #include "agent-priv.h"
 
-G_DEFINE_TYPE (PseudoTcpSocket, pseudo_tcp_socket, G_TYPE_OBJECT);
+struct _PseudoTcpSocketClass {
+    GObjectClass parent_class;
+};
 
+typedef struct _PseudoTcpSocketPrivate PseudoTcpSocketPrivate;
+
+
+struct _PseudoTcpSocket {
+    GObject parent;
+    PseudoTcpSocketPrivate *priv;
+};
+
+G_DEFINE_TYPE (PseudoTcpSocket, pseudo_tcp_socket, G_TYPE_OBJECT);
 
 //////////////////////////////////////////////////////////////////////
 // Network Constants
@@ -107,7 +118,9 @@ const guint16 PACKET_MAXIMUMS[] = {
   0,      // End of list marker
 };
 
-#define MAX_PACKET 65535
+// FIXME: This is a reasonable MTU, but we should get it from the lower layer
+#define DEF_MTU 1400
+#define MAX_PACKET 65532
 // Note: we removed lowest level because packet overhead was larger!
 #define MIN_PACKET 296
 
@@ -151,8 +164,8 @@ const guint16 PACKET_MAXIMUMS[] = {
 #define PACKET_OVERHEAD (HEADER_SIZE + UDP_HEADER_SIZE + \
       IP_HEADER_SIZE + JINGLE_HEADER_SIZE)
 
-// MIN_RTO = 250 ms (RFC1122, Sec 4.2.3.1 "fractions of a second")
-#define MIN_RTO      250
+// MIN_RTO = 1 second (RFC6298, Sec 2.4)
+#define MIN_RTO     1000
 #define DEF_RTO     1000 /* 1 seconds (RFC 6298 sect 2.1) */
 #define MAX_RTO    60000 /* 60 seconds */
 #define DEFAULT_ACK_DELAY    100 /* 100 milliseconds */
@@ -416,6 +429,7 @@ typedef enum {
   sfImmediateAck,
   sfFin,
   sfRst,
+  sfDuplicateAck,
 } SendFlags;
 
 typedef struct {
@@ -471,6 +485,7 @@ struct _PseudoTcpSocketPrivate {
   guint32 rbuf_len, rcv_nxt, rcv_wnd, lastrecv;
   guint8 rwnd_scale; // Window scale factor
   PseudoTcpFifo rbuf;
+  guint32 rcv_fin;  /* sequence number of the received FIN octet, or 0 */
 
   // Outgoing data
   GQueue slist;
@@ -495,7 +510,9 @@ struct _PseudoTcpSocketPrivate {
   guint32 ssthresh, cwnd;
   guint8 dup_acks;
   guint32 recover;
+  gboolean fast_recovery;
   guint32 t_ack;  /* time a delayed ack was scheduled; 0 if no acks scheduled */
+  guint32 last_acked_ts;
 
   gboolean use_nagling;
   guint32 ack_delay;
@@ -550,7 +567,7 @@ static gboolean parse (PseudoTcpSocket *self,
     const guint8 *_header_buf, gsize header_buf_len,
     const guint8 *data_buf, gsize data_buf_len);
 static gboolean process(PseudoTcpSocket *self, Segment *seg);
-static gboolean transmit(PseudoTcpSocket *self, SSegment *sseg, guint32 now);
+static int transmit(PseudoTcpSocket *self, SSegment *sseg, guint32 now);
 static void attempt_send(PseudoTcpSocket *self, SendFlags sflags);
 static void closedown (PseudoTcpSocket *self, guint32 err,
     ClosedownSource source);
@@ -566,6 +583,7 @@ static void set_state_closed (PseudoTcpSocket *self, guint32 err);
 static const gchar *pseudo_tcp_state_get_name (PseudoTcpState state);
 static gboolean pseudo_tcp_state_has_sent_fin (PseudoTcpState state);
 static gboolean pseudo_tcp_state_has_received_fin (PseudoTcpState state);
+static gboolean pseudo_tcp_state_has_received_fin_ack (PseudoTcpState state);
 
 // The following logging is for detailed (packet-level) pseudotcp analysis only.
 static PseudoTcpDebugLevel debug_level = PSEUDO_TCP_DEBUG_NONE;
@@ -809,12 +827,14 @@ pseudo_tcp_socket_init (PseudoTcpSocket *obj)
   priv->snd_una = priv->rcv_nxt = 0;
   priv->bReadEnable = TRUE;
   priv->bWriteEnable = FALSE;
+  priv->rcv_fin = 0;
+
   priv->t_ack = 0;
 
   priv->msslevel = 0;
   priv->largest = 0;
   priv->mss = MIN_PACKET - PACKET_OVERHEAD;
-  priv->mtu_advise = MAX_PACKET;
+  priv->mtu_advise = DEF_MTU;
 
   priv->rto_base = 0;
 
@@ -825,6 +845,7 @@ pseudo_tcp_socket_init (PseudoTcpSocket *obj)
 
   priv->dup_acks = 0;
   priv->recover = 0;
+  priv->last_acked_ts = 0;
 
   priv->ts_recent = priv->ts_lastack = 0;
 
@@ -959,18 +980,24 @@ pseudo_tcp_socket_notify_clock(PseudoTcpSocket *self)
       // retransmit segments
       guint32 nInFlight;
       guint32 rto_limit;
+      int transmit_status;
 
       DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "timeout retransmit (rto: %u) "
           "(rto_base: %u) (now: %u) (dup_acks: %u)",
           priv->rx_rto, priv->rto_base, now, (guint) priv->dup_acks);
 
-      if (!transmit(self, g_queue_peek_head (&priv->slist), now)) {
-        closedown (self, ECONNABORTED, CLOSEDOWN_LOCAL);
+      transmit_status = transmit(self, g_queue_peek_head (&priv->slist), now);
+      if (transmit_status != 0) {
+        DEBUG (PSEUDO_TCP_DEBUG_NORMAL,
+            "Error transmitting segment. Closing down.");
+        closedown (self, transmit_status, CLOSEDOWN_LOCAL);
         return;
       }
 
       nInFlight = priv->snd_nxt - priv->snd_una;
       priv->ssthresh = max(nInFlight / 2, 2 * priv->mss);
+      DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "ssthresh: %u = (nInFlight: %u / 2) + "
+          "2 * mss: %u", priv->ssthresh, nInFlight, priv->mss);
       //LOG(LS_INFO) << "priv->ssthresh: " << priv->ssthresh << "  nInFlight: " << nInFlight << "  priv->mss: " << priv->mss;
       priv->cwnd = priv->mss;
 
@@ -978,6 +1005,13 @@ pseudo_tcp_socket_notify_clock(PseudoTcpSocket *self)
       rto_limit = (priv->state < TCP_ESTABLISHED) ? DEF_RTO : MAX_RTO;
       priv->rx_rto = min(rto_limit, priv->rx_rto * 2);
       priv->rto_base = now;
+
+      priv->recover = priv->snd_nxt;
+      if (priv->dup_acks >= 3) {
+        priv->dup_acks = 0;
+        priv->fast_recovery = FALSE;
+        DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "exit recovery on timeout");
+      }
     }
   }
 
@@ -985,6 +1019,7 @@ pseudo_tcp_socket_notify_clock(PseudoTcpSocket *self)
   if ((priv->snd_wnd == 0)
         && (time_diff(priv->lastsend + priv->rx_rto, now) <= 0)) {
     if (time_diff(now, priv->lastrecv) >= 15000) {
+      DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Receive window closed. Closing down.");
       closedown (self, ECONNABORTED, CLOSEDOWN_LOCAL);
       return;
     }
@@ -1012,9 +1047,11 @@ pseudo_tcp_socket_notify_packet(PseudoTcpSocket *self,
 
   if (len > MAX_PACKET) {
     //LOG_F(WARNING) << "packet too large";
+    self->priv->error = EMSGSIZE;
     return FALSE;
   } else if (len < HEADER_SIZE) {
     //LOG_F(WARNING) << "packet too small";
+    self->priv->error = EINVAL;
     return FALSE;
   }
 
@@ -1149,9 +1186,7 @@ pseudo_tcp_socket_recv(PseudoTcpSocket *self, char * buffer, size_t len)
   gsize available_space;
 
   /* Received a FIN from the peer, so return 0. RFC 793, §3.5, Case 2. */
-  if (priv->support_fin_ack &&
-      (priv->shutdown_reads ||
-       pseudo_tcp_state_has_received_fin (priv->state))) {
+  if (priv->support_fin_ack && priv->shutdown_reads) {
     return 0;
   }
 
@@ -1173,7 +1208,9 @@ pseudo_tcp_socket_recv(PseudoTcpSocket *self, char * buffer, size_t len)
   bytesread = pseudo_tcp_fifo_read (&priv->rbuf, (guint8 *) buffer, len);
 
  // If there's no data in |m_rbuf|.
-  if (bytesread == 0) {
+  if (bytesread == 0 &&
+      !(pseudo_tcp_state_has_received_fin (priv->state) ||
+        pseudo_tcp_state_has_received_fin_ack (priv->state))) {
     priv->bReadEnable = TRUE;
     priv->error = EWOULDBLOCK;
     return -1;
@@ -1407,7 +1444,7 @@ packet(PseudoTcpSocket *self, guint32 seq, TcpFlags flags,
     g_assert (bytes_read == len);
   }
 
-  DEBUG (PSEUDO_TCP_DEBUG_VERBOSE, "<-- <CONV=%u><FLG=%u><SEQ=%u:%u><ACK=%u>"
+  DEBUG (PSEUDO_TCP_DEBUG_VERBOSE, "Sending <CONV=%u><FLG=%u><SEQ=%u:%u><ACK=%u>"
       "<WND=%u><TS=%u><TSR=%u><LEN=%u>",
       priv->conv, (unsigned)flags, seq, seq + len, priv->rcv_nxt, priv->rcv_wnd,
       now % 10000, priv->ts_recent % 10000, len);
@@ -1460,7 +1497,8 @@ parse (PseudoTcpSocket *self, const guint8 *_header_buf, gsize header_buf_len,
   seg.data = (const gchar *) data_buf;
   seg.len = data_buf_len;
 
-  DEBUG (PSEUDO_TCP_DEBUG_VERBOSE, "--> <CONV=%u><FLG=%u><SEQ=%u:%u><ACK=%u>"
+  DEBUG (PSEUDO_TCP_DEBUG_VERBOSE,
+      "Received <CONV=%u><FLG=%u><SEQ=%u:%u><ACK=%u>"
       "<WND=%u><TS=%u><TSR=%u><LEN=%u>",
       seg.conv, (unsigned)seg.flags, seg.seq, seg.seq + seg.len, seg.ack,
       seg.wnd, seg.tsval % 10000, seg.tsecr % 10000, seg.len);
@@ -1516,6 +1554,30 @@ pseudo_tcp_state_has_received_fin (PseudoTcpState state)
   }
 }
 
+/* True iff the @state requires that a FIN-ACK has already been received from
+ * the peer. */
+static gboolean
+pseudo_tcp_state_has_received_fin_ack (PseudoTcpState state)
+{
+  switch (state) {
+  case TCP_LISTEN:
+  case TCP_SYN_SENT:
+  case TCP_SYN_RECEIVED:
+  case TCP_ESTABLISHED:
+  case TCP_FIN_WAIT_1:
+  case TCP_FIN_WAIT_2:
+  case TCP_CLOSING:
+  case TCP_CLOSE_WAIT:
+  case TCP_LAST_ACK:
+    return FALSE;
+  case TCP_CLOSED:
+  case TCP_TIME_WAIT:
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+
 static gboolean
 process(PseudoTcpSocket *self, Segment *seg)
 {
@@ -1529,6 +1591,7 @@ process(PseudoTcpSocket *self, Segment *seg)
   gsize available_space;
   guint32 kIdealRefillSize;
   gboolean is_valuable_ack, is_duplicate_ack, is_fin_ack = FALSE;
+  gboolean received_fin = FALSE;
 
   /* If this is the wrong conversation, send a reset!?!
      (with the correct conversation?) */
@@ -1545,17 +1608,23 @@ process(PseudoTcpSocket *self, Segment *seg)
   priv->bOutgoing = FALSE;
 
   if (priv->state == TCP_CLOSED ||
-      (pseudo_tcp_state_has_sent_fin (priv->state) && seg->len > 0)) {
-    /* Send an RST segment. See: RFC 1122, §4.2.2.13. */
+      (pseudo_tcp_state_has_received_fin_ack (priv->state) && seg->len > 0)) {
+    /* Send an RST segment. See: RFC 1122, §4.2.2.13; RFC 793, §3.4, point 3,
+     * page 37. We can only send RST if we know the peer knows we’re closed;
+     * otherwise this could be a timeout retransmit from them, due to our
+     * packets from data through to FIN being dropped. */
+    DEBUG (PSEUDO_TCP_DEBUG_NORMAL,
+        "Segment received while closed; sending RST.");
     if ((seg->flags & FLAG_RST) == 0) {
       closedown (self, 0, CLOSEDOWN_LOCAL);
     }
-    DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Segment received while closed; sent RST.");
+
     return FALSE;
   }
 
   // Check if this is a reset segment
   if (seg->flags & FLAG_RST) {
+    DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Received RST segment; closing down.");
     closedown (self, ECONNRESET, CLOSEDOWN_REMOTE);
     return FALSE;
   }
@@ -1607,18 +1676,20 @@ process(PseudoTcpSocket *self, Segment *seg)
           priv->rx_rttvar = rtt / 2;
         } else {
           priv->rx_rttvar = (3 * priv->rx_rttvar +
-              abs((long)(rtt - priv->rx_srtt))) / 4;
+              labs((long)(rtt - priv->rx_srtt))) / 4;
           priv->rx_srtt = (7 * priv->rx_srtt + rtt) / 8;
         }
         priv->rx_rto = bound(MIN_RTO,
             priv->rx_srtt + max(1LU, 4 * priv->rx_rttvar), MAX_RTO);
 
-        DEBUG (PSEUDO_TCP_DEBUG_VERBOSE, "rtt: %ld   srtt: %u  rto: %u",
-                rtt, priv->rx_srtt, priv->rx_rto);
+        DEBUG (PSEUDO_TCP_DEBUG_VERBOSE, "rtt: %ld srtt: %u rttvar: %u rto: %u",
+            rtt, priv->rx_srtt, priv->rx_rttvar, priv->rx_rto);
       } else {
         DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Invalid RTT: %ld", rtt);
         return FALSE;
       }
+
+      priv->last_acked_ts = seg->tsecr;
     }
 
     priv->snd_wnd = seg->wnd << priv->swnd_scale;
@@ -1663,16 +1734,24 @@ process(PseudoTcpSocket *self, Segment *seg)
       if (LARGER_OR_EQUAL (priv->snd_una, priv->recover)) { // NewReno
         guint32 nInFlight = priv->snd_nxt - priv->snd_una;
         // (Fast Retransmit)
-        priv->cwnd = min(priv->ssthresh, nInFlight + priv->mss);
-        DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "exit recovery");
+        priv->cwnd = min(priv->ssthresh,
+            max (nInFlight, priv->mss) + priv->mss);
+        DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "exit recovery cwnd=%d ssthresh=%d nInFlight=%d mss: %d", priv->cwnd, priv->ssthresh, nInFlight, priv->mss);
+        priv->fast_recovery = FALSE;
         priv->dup_acks = 0;
       } else {
+        int transmit_status;
+
         DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "recovery retransmit");
-        if (!transmit(self, g_queue_peek_head (&priv->slist), now)) {
-          closedown (self, ECONNABORTED, CLOSEDOWN_LOCAL);
+        transmit_status = transmit(self, g_queue_peek_head (&priv->slist), now);
+        if (transmit_status != 0) {
+          DEBUG (PSEUDO_TCP_DEBUG_NORMAL,
+              "Error transmitting recovery retransmit segment. Closing down.");
+          closedown (self, transmit_status, CLOSEDOWN_LOCAL);
           return FALSE;
         }
-        priv->cwnd += priv->mss - min(nAcked, priv->cwnd);
+        priv->cwnd += (nAcked > priv->mss ? priv->mss : 0) -
+            min(nAcked, priv->cwnd);
       }
     } else {
       priv->dup_acks = 0;
@@ -1695,20 +1774,43 @@ process(PseudoTcpSocket *self, Segment *seg)
       guint32 nInFlight;
 
       priv->dup_acks += 1;
+      DEBUG (PSEUDO_TCP_DEBUG_VERBOSE, "Received dup ack (dups: %u)",
+          priv->dup_acks);
       if (priv->dup_acks == 3) { // (Fast Retransmit)
-        DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "enter recovery");
-        DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "recovery retransmit");
-        if (!transmit(self, g_queue_peek_head (&priv->slist), now)) {
-          closedown (self, ECONNABORTED, CLOSEDOWN_LOCAL);
-          return FALSE;
+        int transmit_status;
+
+
+        if (LARGER_OR_EQUAL (priv->snd_una, priv->recover) ||
+            seg->tsecr == priv->last_acked_ts) { /* NewReno */
+          /* Invoke fast retransmit  RFC3782 section 3 step 1A*/
+          DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "enter recovery");
+          DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "recovery retransmit");
+
+          transmit_status = transmit(self, g_queue_peek_head (&priv->slist),
+              now);
+          if (transmit_status != 0) {
+            DEBUG (PSEUDO_TCP_DEBUG_NORMAL,
+                "Error transmitting recovery retransmit segment. Closing down.");
+
+            closedown (self, transmit_status, CLOSEDOWN_LOCAL);
+            return FALSE;
+          }
+          priv->recover = priv->snd_nxt;
+          nInFlight = priv->snd_nxt - priv->snd_una;
+          priv->ssthresh = max(nInFlight / 2, 2 * priv->mss);
+          DEBUG (PSEUDO_TCP_DEBUG_NORMAL,
+              "ssthresh: %u = max((nInFlight: %u / 2), 2 * mss: %u)",
+              priv->ssthresh, nInFlight, priv->mss);
+          priv->cwnd = priv->ssthresh + 3 * priv->mss;
+          priv->fast_recovery = TRUE;
+        } else {
+          DEBUG (PSEUDO_TCP_DEBUG_VERBOSE,
+              "Skipping fast recovery: recover: %u snd_una: %u", priv->recover,
+              priv->snd_una);
         }
-        priv->recover = priv->snd_nxt;
-        nInFlight = priv->snd_nxt - priv->snd_una;
-        priv->ssthresh = max(nInFlight / 2, 2 * priv->mss);
-        //LOG(LS_INFO) << "priv->ssthresh: " << priv->ssthresh << "  nInFlight: " << nInFlight << "  priv->mss: " << priv->mss;
-        priv->cwnd = priv->ssthresh + 3 * priv->mss;
       } else if (priv->dup_acks > 3) {
-        priv->cwnd += priv->mss;
+        if (priv->fast_recovery)
+          priv->cwnd += priv->mss;
       }
     } else {
       priv->dup_acks = 0;
@@ -1720,19 +1822,31 @@ process(PseudoTcpSocket *self, Segment *seg)
     set_state_established (self);
   }
 
-  /* Check for connection closure. */
+  /* Check for connection closure. Only pay attention to FIN segments if they
+   * are in sequence; otherwise we’ve missed a packet earlier in the stream and
+   * need to request retransmission first. */
   if (priv->support_fin_ack) {
+    /* @received_fin is set when, and only when, all segments preceding the FIN
+     * have been acknowledged. This is to handle the case where the FIN arrives
+     * out of order with a preceding data segment. */
+    if (seg->flags & FLAG_FIN) {
+      priv->rcv_fin = seg->seq;
+      DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Setting rcv_fin = %u", priv->rcv_fin);
+    }
+
     /* For the moment, FIN segments must not contain data. */
     if (seg->flags & FLAG_FIN && seg->len != 0) {
       DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "FIN segment contained data; ignored");
       return FALSE;
     }
 
+    received_fin = (priv->rcv_nxt != 0 && priv->rcv_nxt + seg->len == priv->rcv_fin);
+
     /* Update the state machine, implementing all transitions on ‘rcv FIN’ or
      * ‘rcv ACK of FIN’ from RFC 793, Figure 6; and RFC 1122, §4.2.2.8. */
     switch (priv->state) {
     case TCP_ESTABLISHED:
-      if (seg->flags & FLAG_FIN) {
+      if (received_fin) {
         /* Received a FIN from the network, RFC 793, §3.5, Case 2.
          * The code below will send an ACK for the FIN. */
          set_state (self, TCP_CLOSE_WAIT);
@@ -1751,20 +1865,20 @@ process(PseudoTcpSocket *self, Segment *seg)
       }
       break;
     case TCP_FIN_WAIT_1:
-      if (is_fin_ack && seg->flags & FLAG_FIN) {
+      if (is_fin_ack && received_fin) {
         /* Simultaneous close with an ACK for a FIN previously sent,
          * RFC 793, §3.5, Case 3. */
         set_state (self, TCP_TIME_WAIT);
       } else if (is_fin_ack) {
         /* Handle the ACK of a locally-sent FIN flag. RFC 793, §3.5, Case 1. */
         set_state (self, TCP_FIN_WAIT_2);
-      } else if (seg->flags & FLAG_FIN) {
+      } else if (received_fin) {
         /* Simultaneous close, RFC 793, §3.5, Case 3. */
         set_state (self, TCP_CLOSING);
       }
       break;
     case TCP_FIN_WAIT_2:
-      if (seg->flags & FLAG_FIN) {
+      if (received_fin) {
         /* Local user closed the connection, RFC 793, §3.5, Case 1. */
         set_state (self, TCP_TIME_WAIT);
       }
@@ -1776,7 +1890,7 @@ process(PseudoTcpSocket *self, Segment *seg)
     case TCP_CLOSED:
     case TCP_CLOSE_WAIT:
       /* Shouldn’t ever hit these cases. */
-      if (seg->flags & FLAG_FIN) {
+      if (received_fin) {
         DEBUG (PSEUDO_TCP_DEBUG_NORMAL,
            "Unexpected state %u when FIN received", priv->state);
       } else if (is_fin_ack) {
@@ -1820,19 +1934,20 @@ process(PseudoTcpSocket *self, Segment *seg)
    *    see RFC 793, §3.3. Also see: RFC 793, §3.5.
    */
   if (seg->seq != priv->rcv_nxt) {
-    sflags = sfImmediateAck; // (Fast Recovery)
+    sflags = sfDuplicateAck; // (Fast Recovery)
   } else if (seg->len != 0) {
     if (priv->ack_delay == 0) {
       sflags = sfImmediateAck;
     } else {
       sflags = sfDelayedAck;
     }
-  } else if (seg->flags & FLAG_FIN) {
+  } else if (received_fin) {
+    /* FIN flags have a sequence number. Only acknowledge them after all
+     * preceding octets have been acknowledged. */
     sflags = sfImmediateAck;
-    priv->rcv_nxt += 1;
   }
 
-  if (sflags == sfImmediateAck) {
+  if (sflags == sfDuplicateAck) {
     if (seg->seq > priv->rcv_nxt) {
       DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "too new");
     } else if (SMALLER_OR_EQUAL(seg->seq + seg->len, priv->rcv_nxt)) {
@@ -1869,12 +1984,7 @@ process(PseudoTcpSocket *self, Segment *seg)
 
   bNewData = FALSE;
 
-  if (seg->flags & FLAG_FIN) {
-    /* FIN flags have a sequence number. */
-    if (seg->seq == priv->rcv_nxt) {
-      priv->rcv_nxt++;
-    }
-  } else if (seg->len > 0) {
+  if (seg->len > 0) {
     if (bIgnoreData) {
       if (seg->seq == priv->rcv_nxt) {
         priv->rcv_nxt += seg->len;
@@ -1929,6 +2039,12 @@ process(PseudoTcpSocket *self, Segment *seg)
     }
   }
 
+  if (received_fin) {
+    /* FIN flags have a sequence number. */
+    priv->rcv_nxt++;
+  }
+
+
   attempt_send(self, sflags);
 
   // If we have new data, notify the user
@@ -1952,7 +2068,7 @@ transmit(PseudoTcpSocket *self, SSegment *segment, guint32 now)
 
   if (segment->xmit >= ((priv->state == TCP_ESTABLISHED) ? 15 : 30)) {
     DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "too many retransmits");
-    return FALSE;
+    return ETIMEDOUT;
   }
 
   while (TRUE) {
@@ -1972,7 +2088,7 @@ transmit(PseudoTcpSocket *self, SSegment *segment, guint32 now)
 
     if (wres == WR_FAIL) {
       DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "packet failed");
-      return FALSE;
+      return ECONNABORTED;  /* FIXME: This error code doesn’t quite seem right */
     }
 
     g_assert(wres == WR_TOO_LARGE);
@@ -1980,7 +2096,7 @@ transmit(PseudoTcpSocket *self, SSegment *segment, guint32 now)
     while (TRUE) {
       if (PACKET_MAXIMUMS[priv->msslevel + 1] == 0) {
         DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "MTU too small");
-        return FALSE;
+        return EMSGSIZE;
       }
       /* !?! We need to break up all outstanding and pending packets
          and then retransmit!?! */
@@ -2029,7 +2145,7 @@ transmit(PseudoTcpSocket *self, SSegment *segment, guint32 now)
     priv->rto_base = now;
   }
 
-  return TRUE;
+  return 0;
 }
 
 static void
@@ -2038,6 +2154,8 @@ attempt_send(PseudoTcpSocket *self, SendFlags sflags)
   PseudoTcpSocketPrivate *priv = self->priv;
   guint32 now = get_current_time (self);
   gboolean bFirst = TRUE;
+
+  DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Attempting send with flags %u.", sflags);
 
   if (time_diff(now, priv->lastsend) > (long) priv->rx_rto) {
     priv->cwnd = priv->mss;
@@ -2053,6 +2171,7 @@ attempt_send(PseudoTcpSocket *self, SendFlags sflags)
     gsize snd_buffered;
     GList *iter;
     SSegment *sseg;
+    int transmit_status;
 
     cwnd = priv->cwnd;
     if ((priv->dup_acks == 1) || (priv->dup_acks == 2)) { // Limited Transmit
@@ -2078,12 +2197,19 @@ attempt_send(PseudoTcpSocket *self, SendFlags sflags)
 
     if (bFirst) {
       gsize available_space = pseudo_tcp_fifo_get_write_remaining (&priv->sbuf);
+
       bFirst = FALSE;
       DEBUG (PSEUDO_TCP_DEBUG_VERBOSE, "[cwnd: %u  nWindow: %u  nInFlight: %u "
           "nAvailable: %u nQueued: %" G_GSIZE_FORMAT " nEmpty: %" G_GSIZE_FORMAT
-          "  ssthresh: %u]",
+          "  nWaiting: %zu ssthresh: %u]",
           priv->cwnd, nWindow, nInFlight, nAvailable, snd_buffered,
-          available_space, priv->ssthresh);
+          available_space, snd_buffered - nInFlight, priv->ssthresh);
+    }
+
+    if (sflags == sfDuplicateAck) {
+      packet(self, priv->snd_nxt, 0, 0, 0, now);
+      sflags = sfNone;
+      continue;
     }
 
     if (nAvailable == 0 && sflags != sfFin && sflags != sfRst) {
@@ -2091,7 +2217,8 @@ attempt_send(PseudoTcpSocket *self, SendFlags sflags)
         return;
 
       // If this is an immediate ack, or the second delayed ack
-      if ((sflags == sfImmediateAck) || priv->t_ack) {
+      if ((sflags == sfImmediateAck || sflags == sfDuplicateAck) ||
+          priv->t_ack) {
         packet(self, priv->snd_nxt, 0, 0, 0, now);
       } else {
         priv->t_ack = now;
@@ -2128,9 +2255,12 @@ attempt_send(PseudoTcpSocket *self, SendFlags sflags)
           subseg);
     }
 
-    if (!transmit(self, sseg, now)) {
+    transmit_status = transmit(self, sseg, now);
+    if (transmit_status != 0) {
       DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "transmit failed");
-      // TODO: consider closing socket
+
+      // TODO: Is this the right thing ?
+      closedown (self, transmit_status, CLOSEDOWN_REMOTE);
       return;
     }
 
@@ -2146,6 +2276,9 @@ static void
 closedown (PseudoTcpSocket *self, guint32 err, ClosedownSource source)
 {
   PseudoTcpSocketPrivate *priv = self->priv;
+
+  DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Closing down socket %p with %s error %u.",
+      self, (source == CLOSEDOWN_LOCAL) ? "local" : "remote", err);
 
   if (source == CLOSEDOWN_LOCAL && priv->support_fin_ack) {
     queue_rst_message (self);
@@ -2211,6 +2344,7 @@ apply_window_scale_option (PseudoTcpSocket *self, guint8 scale_factor)
    PseudoTcpSocketPrivate *priv = self->priv;
 
    priv->swnd_scale = scale_factor;
+   DEBUG (PSEUDO_TCP_DEBUG_NORMAL, "Setting scale factor to %u", scale_factor);
 }
 
 static void
@@ -2375,10 +2509,6 @@ pseudo_tcp_socket_get_available_bytes (PseudoTcpSocket *self)
 {
   PseudoTcpSocketPrivate *priv = self->priv;
 
-  if (priv->state != TCP_ESTABLISHED) {
-    return -1;
-  }
-
   return pseudo_tcp_fifo_get_buffered (&priv->rbuf);
 }
 
@@ -2394,11 +2524,11 @@ pseudo_tcp_socket_get_available_send_space (PseudoTcpSocket *self)
   PseudoTcpSocketPrivate *priv = self->priv;
   gsize ret;
 
-
-  if (priv->state == TCP_ESTABLISHED)
+  if (!pseudo_tcp_state_has_sent_fin (priv->state)) {
     ret = pseudo_tcp_fifo_get_write_remaining (&priv->sbuf);
-  else
+  } else {
     ret = 0;
+  }
 
   if (ret == 0)
     priv->bWriteEnable = TRUE;

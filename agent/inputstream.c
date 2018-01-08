@@ -332,8 +332,8 @@ nice_input_stream_close (GInputStream *stream, GCancellable *cancellable,
     GError **error)
 {
   NiceInputStreamPrivate *priv = NICE_INPUT_STREAM (stream)->priv;
-  Component *component = NULL;
-  Stream *_stream = NULL;
+  NiceComponent *component = NULL;
+  NiceStream *_stream = NULL;
   NiceAgent *agent;  /* owned */
 
   /* Has the agent disappeared? */
@@ -361,8 +361,8 @@ static gboolean
 nice_input_stream_is_readable (GPollableInputStream *stream)
 {
   NiceInputStreamPrivate *priv = NICE_INPUT_STREAM (stream)->priv;
-  Component *component = NULL;
-  Stream *_stream = NULL;
+  NiceComponent *component = NULL;
+  NiceStream *_stream = NULL;
   gboolean retval = FALSE;
   GSList *i;
   NiceAgent *agent;  /* owned */
@@ -458,7 +458,7 @@ nice_input_stream_create_source (GPollableInputStream *stream,
   if (agent == NULL)
     goto dummy_source;
 
-  component_source = component_input_source_new (agent, priv->stream_id,
+  component_source = nice_component_input_source_new (agent, priv->stream_id,
       priv->component_id, stream, cancellable);
 
   g_object_unref (agent);

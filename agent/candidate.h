@@ -37,8 +37,8 @@
  * file under either the MPL or the LGPL.
  */
 
-#ifndef _CANDIDATE_H
-#define _CANDIDATE_H
+#ifndef __LIBNICE_CANDIDATE_H__
+#define __LIBNICE_CANDIDATE_H__
 
 #include <glib.h>
 #include <glib-object.h>
@@ -64,8 +64,8 @@ G_BEGIN_DECLS
 #define NICE_CANDIDATE_TYPE_PREF_PEER_REFLEXIVE       110
 #define NICE_CANDIDATE_TYPE_PREF_NAT_ASSISTED         105
 #define NICE_CANDIDATE_TYPE_PREF_SERVER_REFLEXIVE     100
-#define NICE_CANDIDATE_TYPE_PREF_UDP_TUNNELED          75
-#define NICE_CANDIDATE_TYPE_PREF_RELAYED               10
+#define NICE_CANDIDATE_TYPE_PREF_RELAYED_UDP           30
+#define NICE_CANDIDATE_TYPE_PREF_RELAYED               20
 
 /* Priority preference constants for MS-ICE compatibility */
 #define NICE_CANDIDATE_TRANSPORT_MS_PREF_UDP           15
@@ -193,8 +193,8 @@ struct _NiceCandidate
   guint stream_id;
   guint component_id;
   gchar foundation[NICE_CANDIDATE_MAX_FOUNDATION];
-  gchar *username;        /* pointer to a NULL-terminated username string */
-  gchar *password;        /* pointer to a NULL-terminated password string */
+  gchar *username;        /* pointer to a nul-terminated username string */
+  gchar *password;        /* pointer to a nul-terminated password string */
   TurnServer *turn;
   gpointer sockptr;
 };
@@ -241,5 +241,5 @@ GType nice_candidate_get_type (void);
 
 G_END_DECLS
 
-#endif /* _CANDIDATE_H */
+#endif /* __LIBNICE_CANDIDATE_H__ */
 

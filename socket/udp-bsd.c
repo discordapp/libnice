@@ -50,6 +50,7 @@
 #include <fcntl.h>
 
 #include "udp-bsd.h"
+#include "agent-priv.h"
 
 #ifndef G_OS_WIN32
 #include <unistd.h>
@@ -183,9 +184,8 @@ socket_recv_messages (NiceSocket *sock,
   guint i;
   gboolean error = FALSE;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return 0;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   /* Read messages into recv_messages until one fails or would block, or we
    * reach the end. */
@@ -204,7 +204,10 @@ socket_recv_messages (NiceSocket *sock,
     recv_message->length = MAX (recvd, 0);
 
     if (recvd < 0) {
-      if (g_error_matches (gerr, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
+      /* Handle ECONNRESET here as if it were EWOULDBLOCK; see
+       * https://phabricator.freedesktop.org/T121 */
+      if (g_error_matches (gerr, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK) ||
+          g_error_matches (gerr, G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED))
         recvd = 0;
       else
         error = TRUE;
@@ -245,9 +248,8 @@ socket_send_message (NiceSocket *sock, const NiceAddress *to,
   GError *child_error = NULL;
   gssize len;
 
-  /* Socket has been closed: */
-  if (priv == NULL)
-    return -1;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   if (!nice_address_is_valid (&priv->niceaddr) ||
       !nice_address_equal (&priv->niceaddr, to)) {
@@ -274,8 +276,12 @@ socket_send_message (NiceSocket *sock, const NiceAddress *to,
       message->n_buffers, NULL, 0, G_SOCKET_MSG_NONE, NULL, &child_error);
 
   if (len < 0) {
-    if (g_error_matches (child_error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
+    if (g_error_matches (child_error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
       len = 0;
+    } else {
+      nice_debug_verbose ("%s: udp-bsd socket %p: error: %s", G_STRFUNC, sock,
+          child_error->message);
+    }
 
     g_error_free (child_error);
   }
@@ -289,9 +295,8 @@ socket_send_messages (NiceSocket *sock, const NiceAddress *to,
 {
   guint i;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return -1;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   for (i = 0; i < n_messages; i++) {
     const NiceOutputMessage *message = &messages[i];

@@ -71,6 +71,34 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 
+#endif /* G_OS_UNIX */
+
+#if (defined(G_OS_UNIX) && defined(HAVE_GETIFADDRS)) || defined(G_OS_WIN32)
+/* Works on both UNIX and Windows. Magic! */
+static gchar *
+sockaddr_to_string (const struct sockaddr *addr)
+{
+  char addr_as_string[INET6_ADDRSTRLEN+1];
+  size_t addr_len;
+
+  switch (addr->sa_family) {
+    case AF_INET: addr_len = sizeof (struct sockaddr_in); break;
+    case AF_INET6: addr_len = sizeof (struct sockaddr_in6); break;
+    default: return NULL;
+  }
+
+  if (getnameinfo (addr, addr_len,
+          addr_as_string, sizeof (addr_as_string), NULL, 0,
+          NI_NUMERICHOST) != 0) {
+    return NULL;
+  }
+
+  return g_strdup (addr_as_string);
+}
+#endif
+
+#ifdef G_OS_UNIX
+
 #ifdef HAVE_GETIFADDRS
 
 GList *
@@ -190,10 +218,24 @@ nice_interfaces_is_private_ip (const struct sockaddr *_sa)
   return FALSE;
 }
 
-#ifdef HAVE_GETIFADDRS
+static GList *
+add_ip_to_list (GList *list, gchar *ip, gboolean append)
+{
+  GList *i;
 
-static gchar *
-sockaddr_to_string (const struct sockaddr *addr);
+  for (i = list; i; i = i->next) {
+    gchar *addr = (gchar *) i->data;
+
+    if (g_strcmp0 (addr, ip) == 0)
+      return list;
+  }
+  if (append)
+    return g_list_append (list, ip);
+  else
+    return g_list_prepend (list, ip);
+}
+
+#ifdef HAVE_GETIFADDRS
 
 GList *
 nice_interfaces_get_local_ips (gboolean include_loopback)
@@ -229,16 +271,16 @@ nice_interfaces_get_local_ips (gboolean include_loopback)
     nice_debug ("IP Address: %s", addr_string);
     if ((ifa->ifa_flags & IFF_LOOPBACK) == IFF_LOOPBACK) {
       if (include_loopback) {
-        loopbacks = g_list_append (loopbacks, addr_string);
+        loopbacks = add_ip_to_list (loopbacks, addr_string, TRUE);
       } else {
         nice_debug ("Ignoring loopback interface");
         g_free (addr_string);
       }
     } else {
       if (nice_interfaces_is_private_ip (ifa->ifa_addr))
-        ips = g_list_append (ips, addr_string);
+        ips = add_ip_to_list (ips, addr_string, TRUE);
       else
-        ips = g_list_prepend (ips, addr_string);
+        ips = add_ip_to_list (ips, addr_string, FALSE);
     }
   }
 
@@ -311,10 +353,10 @@ nice_interfaces_get_local_ips (gboolean include_loopback)
       else
         nice_debug ("Ignoring loopback interface");
     } else {
-      if (nice_interfaces_is_private_ip (sa)) {
-        ips = g_list_append (ips, g_strdup (inet_ntoa (sa->sin_addr)));
+      if (nice_interfaces_is_private_ip ((struct sockaddr *) sa)) {
+        ips = add_ip_to_list (ips, g_strdup (inet_ntoa (sa->sin_addr)), TRUE);
       } else {
-        ips = g_list_prepend (ips, g_strdup (inet_ntoa (sa->sin_addr)));
+        ips = add_ip_to_list (ips, g_strdup (inet_ntoa (sa->sin_addr)), FALSE);
       }
     }
   }
@@ -323,7 +365,7 @@ nice_interfaces_get_local_ips (gboolean include_loopback)
   free (ifc.ifc_req);
 
   if (loopback)
-    ips = g_list_append (ips, loopback);
+    ips = add_ip_to_list (ips, loopback, TRUE);
 
   return ips;
 }
@@ -443,9 +485,6 @@ GList * nice_interfaces_get_local_interfaces (void)
 
   return ret;
 }
-
-static gchar *
-sockaddr_to_string (const struct sockaddr *addr);
 
 GList * nice_interfaces_get_local_ips (gboolean include_loopback)
 {
@@ -621,25 +660,3 @@ gchar * nice_interfaces_get_ip_for_interface (gchar *interface_name)
 #error Can not use this method for retreiving ip list from OS other than unix or windows
 #endif /* G_OS_WIN32 */
 #endif /* G_OS_UNIX */
-
-/* Works on both UNIX and Windows. Magic! */
-static gchar *
-sockaddr_to_string (const struct sockaddr *addr)
-{
-  char addr_as_string[INET6_ADDRSTRLEN+1];
-  size_t addr_len;
-
-  switch (addr->sa_family) {
-    case AF_INET: addr_len = sizeof (struct sockaddr_in); break;
-    case AF_INET6: addr_len = sizeof (struct sockaddr_in6); break;
-    default: return NULL;
-  }
-
-  if (getnameinfo (addr, addr_len,
-          addr_as_string, sizeof (addr_as_string), NULL, 0,
-          NI_NUMERICHOST) != 0) {
-    return NULL;
-  }
-
-  return g_strdup (addr_as_string);
-}

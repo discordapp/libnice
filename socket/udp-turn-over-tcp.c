@@ -86,6 +86,7 @@ static gboolean socket_is_reliable (NiceSocket *sock);
 static gboolean socket_can_send (NiceSocket *sock, NiceAddress *addr);
 static void socket_set_writable_callback (NiceSocket *sock,
     NiceSocketWritableCb callback, gpointer user_data);
+static gboolean socket_is_based_on (NiceSocket *sock, NiceSocket *other);
 
 NiceSocket *
 nice_udp_turn_over_tcp_socket_new (NiceSocket *base_socket,
@@ -107,6 +108,7 @@ nice_udp_turn_over_tcp_socket_new (NiceSocket *base_socket,
   sock->is_reliable = socket_is_reliable;
   sock->can_send = socket_can_send;
   sock->set_writable_callback = socket_set_writable_callback;
+  sock->is_based_on = socket_is_based_on;
   sock->close = socket_close;
 
   return sock;
@@ -134,9 +136,8 @@ socket_recv_message (NiceSocket *sock, NiceInputMessage *recv_message)
   GInputVector local_recv_buf;
   NiceInputMessage local_recv_message;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return 0;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   if (priv->expecting_len == 0) {
     guint headerlen = 0;
@@ -241,9 +242,8 @@ socket_recv_messages (NiceSocket *nicesock,
   guint i;
   gboolean error = FALSE;
 
-  /* Socket has been closed: */
-  if (nicesock->priv == NULL)
-    return 0;
+  /* Make sure socket has not been freed: */
+  g_assert (nicesock->priv != NULL);
 
   for (i = 0; i < n_recv_messages; i++) {
     gssize len;
@@ -285,9 +285,8 @@ socket_send_message (NiceSocket *sock, const NiceAddress *to,
   } header_buf;
   guint offset = 0;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return -1;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   /* Count the number of buffers. */
   if (message->n_buffers == -1) {
@@ -301,7 +300,7 @@ socket_send_message (NiceSocket *sock, const NiceAddress *to,
 
   /* Allocate a new array of buffers, covering all the buffers in the input
    * @message, but with an additional one for a header and one for a footer. */
-  local_bufs = g_malloc_n (n_bufs + 1, sizeof (GOutputVector));
+  local_bufs = g_alloca ((n_bufs + 1) * sizeof (GOutputVector));
   local_message.buffers = local_bufs;
   local_message.n_buffers = n_bufs + 1;
 
@@ -377,8 +376,6 @@ socket_send_message (NiceSocket *sock, const NiceAddress *to,
   if (ret == 1)
     ret = output_message_get_size (&local_message);
 
-  g_free (local_bufs);
-
   return ret;
 }
 
@@ -388,9 +385,8 @@ socket_send_messages (NiceSocket *sock, const NiceAddress *to,
 {
   guint i;
 
-  /* Socket has been closed: */
-  if (sock->priv == NULL)
-    return -1;
+  /* Make sure socket has not been freed: */
+  g_assert (sock->priv != NULL);
 
   for (i = 0; i < n_messages; i++) {
     const NiceOutputMessage *message = &messages[i];
@@ -457,4 +453,13 @@ socket_set_writable_callback (NiceSocket *sock,
   TurnTcpPriv *priv = sock->priv;
 
   nice_socket_set_writable_callback (priv->base_socket, callback, user_data);
+}
+
+static gboolean
+socket_is_based_on (NiceSocket *sock, NiceSocket *other)
+{
+  TurnTcpPriv *priv = sock->priv;
+
+  return (sock == other) ||
+      (priv && nice_socket_is_based_on (priv->base_socket, other));
 }

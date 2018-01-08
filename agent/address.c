@@ -51,7 +51,6 @@
 #include "address.h"
 
 #ifdef G_OS_WIN32
-#define inet_pton inet_pton_win32
 #define inet_ntop inet_ntop_win32
 
 /* Defined in recent versions of mingw:
@@ -84,36 +83,6 @@ inet_ntop_win32 (int af, const void *src, char *dst, socklen_t cnt)
     return dst;
   }
   return NULL;
-}
-
-static int
-inet_pton_win32(int af, const char *src, void *dst)
-{
-  struct addrinfo hints, *res, *ressave;
-
-  memset(&hints, 0, sizeof(struct addrinfo));
-  hints.ai_family = af;
-
-  if (getaddrinfo(src, NULL, &hints, &res) != 0) {
-    return 0;
-  }
-
-  ressave = res;
-
-  while (res)  {
-    if( res->ai_addr->sa_family == AF_INET) {
-      memcpy(dst, &((struct sockaddr_in *) res->ai_addr)->sin_addr,
-          sizeof(struct in_addr));
-      res = res->ai_next;
-    } else if(res->ai_addr->sa_family == AF_INET6) {
-      memcpy(dst, &((struct sockaddr_in6 *) res->ai_addr)->sin6_addr,
-          sizeof(struct in_addr6));
-      res = res->ai_next;
-    }
-  }
-
-  freeaddrinfo(ressave);
-  return 1;
 }
 
 #endif
@@ -297,7 +266,8 @@ nice_address_equal (const NiceAddress *a, const NiceAddress *b)
     case AF_INET6:
       return IN6_ARE_ADDR_EQUAL (&a->s.ip6.sin6_addr, &b->s.ip6.sin6_addr)
           && (a->s.ip6.sin6_port == b->s.ip6.sin6_port)
-          && (a->s.ip6.sin6_scope_id == b->s.ip6.sin6_scope_id);
+          && (a->s.ip6.sin6_scope_id == 0 || b->s.ip6.sin6_scope_id == 0 ||
+              (a->s.ip6.sin6_scope_id == b->s.ip6.sin6_scope_id));
 
     default:
       g_return_val_if_reached (FALSE);
@@ -412,7 +382,8 @@ nice_address_equal_no_port (const NiceAddress *a, const NiceAddress *b)
 
     case AF_INET6:
       return IN6_ARE_ADDR_EQUAL (&a->s.ip6.sin6_addr, &b->s.ip6.sin6_addr)
-          && (a->s.ip6.sin6_scope_id == b->s.ip6.sin6_scope_id);
+          && (a->s.ip6.sin6_scope_id == 0 || b->s.ip6.sin6_scope_id == 0 ||
+              (a->s.ip6.sin6_scope_id == b->s.ip6.sin6_scope_id));
 
     default:
       g_return_val_if_reached (FALSE);

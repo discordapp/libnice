@@ -228,6 +228,8 @@ typedef enum
  * as defined by [MS-TURN]
  * @STUN_ATTRIBUTE_CANDIDATE_IDENTIFIER: The CANDIDATE-IDENTIFIER optional
  * attribute as defined by [MS-ICE2]
+ * @STUN_ATTRIBUTE_MS_IMPLEMENTATION_VERSION: The IMPLEMENTATION-VERSION
+ * optional attribute as defined by [MS-ICE2]
  *
  * Known STUN attribute types as defined by various RFCs and drafts
  */
@@ -305,8 +307,10 @@ typedef enum
   /* 0x802B-0x804F */      /* reserved */
   STUN_ATTRIBUTE_MS_SEQUENCE_NUMBER=0x8050,     /* MS-TURN */
   /* 0x8051-0x8053 */      /* reserved */
-  STUN_ATTRIBUTE_CANDIDATE_IDENTIFIER=0x8054    /* MS-ICE2 */
-  /* 0x8055-0xFFFF */      /* reserved */
+  STUN_ATTRIBUTE_CANDIDATE_IDENTIFIER=0x8054,     /* MS-ICE2 */
+  /* 0x8055-0x806F */      /* reserved */
+  STUN_ATTRIBUTE_MS_IMPLEMENTATION_VERSION=0x8070 /* MS-ICE2 */
+  /* 0x8071-0xFFFF */      /* reserved */
 } StunAttribute;
 
 
@@ -625,7 +629,7 @@ StunMessageReturn stun_message_find64 (const StunMessage *msg,
  *
  <note>
    <para>
-    The string will be NULL-terminated.
+    The string will be nul-terminated.
    </para>
  </note>
  *
@@ -779,7 +783,7 @@ StunMessageReturn stun_message_append64 (StunMessage *msg,
  * @type: The #StunAttribute to append
  * @str: The string to append
  *
- * Adds an attribute from a NULL-terminated string to a STUN message
+ * Adds an attribute from a nul-terminated string to a STUN message
  *
  * Returns: A #StunMessageReturn value.
  */
@@ -1001,7 +1005,7 @@ bool stun_optional (uint16_t t);
  *
  * Transforms a STUN error-code into a human readable string
  *
- * Returns: A static pointer to a NULL-terminated error message string.
+ * Returns: A static pointer to a nul-terminated error message string.
  */
 const char *stun_strerror (StunError code);
 

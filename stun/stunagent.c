@@ -62,6 +62,8 @@ void stun_agent_init (StunAgent *agent, const uint16_t *known_attributes,
   agent->compatibility = compatibility;
   agent->usage_flags = usage_flags;
   agent->software_attribute = NULL;
+  agent->ms_ice2_send_legacy_connchecks =
+      compatibility == STUN_COMPATIBILITY_MSICE2;
 
   for (i = 0; i < STUN_AGENT_MAX_SAVED_IDS; i++) {
     agent->sent_ids[i].valid = FALSE;
@@ -98,13 +100,48 @@ bool stun_agent_default_validater (StunAgent *agent,
 
 }
 
+static bool stun_agent_check_fingerprint(StunAgent *agent, StunMessage *msg)
+{
+  uint32_t fpr;
+  uint32_t crc32;
+  uint16_t msg_len;
+
+  /* Looks for FINGERPRINT */
+  if (stun_message_find32 (msg, STUN_ATTRIBUTE_FINGERPRINT, &fpr) !=
+      STUN_MESSAGE_RETURN_SUCCESS) {
+    stun_debug ("STUN demux error: no FINGERPRINT attribute!");
+    return FALSE;
+  }
+
+  msg_len = stun_message_length (msg);
+
+  /* Checks FINGERPRINT */
+  crc32 = stun_fingerprint (msg->buffer, msg_len, FALSE);
+  fpr = ntohl (fpr);
+  if (fpr != crc32) {
+    uint16_t palen;
+
+    /* [MS-ICE2] 3.1.4.8.2 Connectivity Checks Phase - legacy compatibility */
+    if (agent->compatibility == STUN_COMPATIBILITY_MSICE2 &&
+        stun_message_find (msg, STUN_ATTRIBUTE_MS_IMPLEMENTATION_VERSION,
+            &palen) == NULL &&
+        fpr == stun_fingerprint (msg->buffer, msg_len, TRUE)) {
+      return TRUE;
+    }
+
+    stun_debug ("STUN demux error: bad fingerprint: 0x%08x, expected: 0x%08x!",
+        fpr, crc32);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
 StunValidationStatus stun_agent_validate (StunAgent *agent, StunMessage *msg,
     const uint8_t *buffer, size_t buffer_len,
     StunMessageIntegrityValidate validater, void * validater_data)
 {
   StunTransactionId msg_id;
-  uint32_t fpr;
-  uint32_t crc32;
   int len;
   uint8_t *username = NULL;
   uint16_t username_len;
@@ -113,11 +150,12 @@ StunValidationStatus stun_agent_validate (StunAgent *agent, StunMessage *msg,
   uint8_t *hash;
   uint8_t sha[20];
   uint16_t hlen;
+  uint32_t implementation_version;
   int sent_id_idx = -1;
   uint16_t unknown;
   int error_code;
   int ignore_credentials = 0;
-  uint8_t long_term_key[16];
+  uint8_t long_term_key[16] = { 0 };
   bool long_term_key_valid = FALSE;
 
   len = stun_message_validate_buffer_length (buffer, buffer_len,
@@ -139,28 +177,16 @@ StunValidationStatus stun_agent_validate (StunAgent *agent, StunMessage *msg,
 
   /* TODO: reject it or not ? */
   if ((agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-          agent->compatibility == STUN_COMPATIBILITY_WLM2009) &&
+       agent->compatibility == STUN_COMPATIBILITY_MSICE2) &&
       !stun_message_has_cookie (msg)) {
       stun_debug ("STUN demux error: no cookie!");
       return STUN_VALIDATION_BAD_REQUEST;
   }
 
   if ((agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-          agent->compatibility == STUN_COMPATIBILITY_WLM2009) &&
+       agent->compatibility == STUN_COMPATIBILITY_MSICE2) &&
       agent->usage_flags & STUN_AGENT_USAGE_USE_FINGERPRINT) {
-    /* Looks for FINGERPRINT */
-    if (stun_message_find32 (msg, STUN_ATTRIBUTE_FINGERPRINT, &fpr) !=
-        STUN_MESSAGE_RETURN_SUCCESS) {
-      stun_debug ("STUN demux error: no FINGERPRINT attribute!");
-      return STUN_VALIDATION_BAD_REQUEST;
-    }
-    /* Checks FINGERPRINT */
-    crc32 = stun_fingerprint (msg->buffer, stun_message_length (msg),
-        agent->compatibility == STUN_COMPATIBILITY_WLM2009);
-    fpr = ntohl (fpr);
-    if (fpr != crc32) {
-      stun_debug ("STUN demux error: bad fingerprint: 0x%08x,"
-          " expected: 0x%08x!", fpr, crc32);
+    if (stun_agent_check_fingerprint(agent, msg) == FALSE) {
       return STUN_VALIDATION_BAD_REQUEST;
     }
 
@@ -264,7 +290,7 @@ StunValidationStatus stun_agent_validate (StunAgent *agent, StunMessage *msg,
             agent->compatibility == STUN_COMPATIBILITY_OC2007) {
           stun_sha1 (msg->buffer, hash + 20 - msg->buffer, hash - msg->buffer,
               sha, md5, sizeof(md5), TRUE);
-        } else if (agent->compatibility == STUN_COMPATIBILITY_WLM2009) {
+        } else if (agent->compatibility == STUN_COMPATIBILITY_MSICE2) {
           stun_sha1 (msg->buffer, hash + 20 - msg->buffer,
               stun_message_length (msg) - 20, sha, md5, sizeof(md5), TRUE);
         } else {
@@ -276,7 +302,7 @@ StunValidationStatus stun_agent_validate (StunAgent *agent, StunMessage *msg,
             agent->compatibility == STUN_COMPATIBILITY_OC2007) {
           stun_sha1 (msg->buffer, hash + 20 - msg->buffer, hash - msg->buffer,
               sha, key, key_len, TRUE);
-        } else if (agent->compatibility == STUN_COMPATIBILITY_WLM2009) {
+        } else if (agent->compatibility == STUN_COMPATIBILITY_MSICE2) {
           stun_sha1 (msg->buffer, hash + 20 - msg->buffer,
               stun_message_length (msg) - 20, sha, key, key_len, TRUE);
         } else {
@@ -310,6 +336,12 @@ StunValidationStatus stun_agent_validate (StunAgent *agent, StunMessage *msg,
 
   if (sent_id_idx != -1 && sent_id_idx < STUN_AGENT_MAX_SAVED_IDS) {
     agent->sent_ids[sent_id_idx].valid = FALSE;
+  }
+
+  /* [MS-ICE2] 3.1.4.8.2 stop sending additional connectivity checks */
+  if (stun_message_find32(msg, STUN_ATTRIBUTE_MS_IMPLEMENTATION_VERSION,
+      &implementation_version) == STUN_MESSAGE_RETURN_SUCCESS) {
+    msg->agent->ms_ice2_send_legacy_connchecks = FALSE;
   }
 
   if (stun_agent_find_unknowns (agent, msg, &unknown, 1) > 0) {
@@ -357,12 +389,12 @@ bool stun_agent_init_request (StunAgent *agent, StunMessage *msg,
 
   if (ret) {
     if (agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-        agent->compatibility == STUN_COMPATIBILITY_WLM2009) {
+        agent->compatibility == STUN_COMPATIBILITY_MSICE2) {
       uint32_t cookie = htonl (STUN_MAGIC_COOKIE);
       memcpy (msg->buffer + STUN_MESSAGE_TRANS_ID_POS, &cookie, sizeof (cookie));
     }
     if ((agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-            agent->compatibility == STUN_COMPATIBILITY_WLM2009) &&
+         agent->compatibility == STUN_COMPATIBILITY_MSICE2) &&
         (agent->software_attribute != NULL ||
             agent->usage_flags & STUN_AGENT_USAGE_ADD_SOFTWARE)) {
       stun_message_append_software (msg, agent->software_attribute);
@@ -391,7 +423,7 @@ bool stun_agent_init_indication (StunAgent *agent, StunMessage *msg,
 
   if (ret) {
     if (agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-        agent->compatibility == STUN_COMPATIBILITY_WLM2009) {
+        agent->compatibility == STUN_COMPATIBILITY_MSICE2) {
       uint32_t cookie = htonl (STUN_MAGIC_COOKIE);
       memcpy (msg->buffer + STUN_MESSAGE_TRANS_ID_POS, &cookie, sizeof (cookie));
     }
@@ -426,7 +458,7 @@ bool stun_agent_init_response (StunAgent *agent, StunMessage *msg,
           stun_message_get_method (request), id)) {
 
     if ((agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-            agent->compatibility == STUN_COMPATIBILITY_WLM2009) &&
+         agent->compatibility == STUN_COMPATIBILITY_MSICE2) &&
         (agent->software_attribute != NULL ||
             agent->usage_flags & STUN_AGENT_USAGE_ADD_SOFTWARE)) {
       stun_message_append_software (msg, agent->software_attribute);
@@ -463,7 +495,7 @@ bool stun_agent_init_error (StunAgent *agent, StunMessage *msg,
           stun_message_get_method (request), id)) {
 
     if ((agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-            agent->compatibility == STUN_COMPATIBILITY_WLM2009) &&
+         agent->compatibility == STUN_COMPATIBILITY_MSICE2) &&
         (agent->software_attribute != NULL ||
             agent->usage_flags & STUN_AGENT_USAGE_ADD_SOFTWARE)) {
       stun_message_append_software (msg, agent->software_attribute);
@@ -513,8 +545,20 @@ size_t stun_agent_finish_message (StunAgent *agent, StunMessage *msg,
   uint32_t fpr;
   int saved_id_idx = 0;
   uint8_t md5[16];
+  bool remember_transaction;
 
-  if (stun_message_get_class (msg) == STUN_REQUEST) {
+  remember_transaction = (stun_message_get_class (msg) == STUN_REQUEST);
+
+  if (agent->compatibility == STUN_COMPATIBILITY_OC2007 &&
+      stun_message_get_method (msg) == STUN_SEND) {
+    /* As per [MS-TURN] Section 2.2.1, the TURN server doesn't send responses to
+     * STUN_SEND requests, so don't bother waiting for them. More details at
+     * https://msdn.microsoft.com/en-us/library/dd946797%28v=office.12%29.aspx.
+     */
+    remember_transaction = FALSE;
+  }
+
+  if (remember_transaction) {
     for (saved_id_idx = 0; saved_id_idx < STUN_AGENT_MAX_SAVED_IDS; saved_id_idx++) {
       if (agent->sent_ids[saved_id_idx].valid == FALSE) {
         break;
@@ -569,7 +613,7 @@ size_t stun_agent_finish_message (StunAgent *agent, StunMessage *msg,
             agent->compatibility == STUN_COMPATIBILITY_OC2007) {
           stun_sha1 (msg->buffer, stun_message_length (msg),
               stun_message_length (msg) - 20, ptr, md5, sizeof(md5), TRUE);
-        } else if (agent->compatibility == STUN_COMPATIBILITY_WLM2009) {
+        } else if (agent->compatibility == STUN_COMPATIBILITY_MSICE2) {
           size_t minus = 20;
           if (agent->usage_flags & STUN_AGENT_USAGE_USE_FINGERPRINT)
             minus -= 8;
@@ -585,7 +629,7 @@ size_t stun_agent_finish_message (StunAgent *agent, StunMessage *msg,
             agent->compatibility == STUN_COMPATIBILITY_OC2007) {
           stun_sha1 (msg->buffer, stun_message_length (msg),
               stun_message_length (msg) - 20, ptr, key, key_len, TRUE);
-        } else if (agent->compatibility == STUN_COMPATIBILITY_WLM2009) {
+        } else if (agent->compatibility == STUN_COMPATIBILITY_MSICE2) {
           size_t minus = 20;
           if (agent->usage_flags & STUN_AGENT_USAGE_USE_FINGERPRINT)
             minus -= 8;
@@ -605,22 +649,21 @@ size_t stun_agent_finish_message (StunAgent *agent, StunMessage *msg,
   }
 
   if ((agent->compatibility == STUN_COMPATIBILITY_RFC5389 ||
-          agent->compatibility == STUN_COMPATIBILITY_WLM2009) &&
+       agent->compatibility == STUN_COMPATIBILITY_MSICE2) &&
       agent->usage_flags & STUN_AGENT_USAGE_USE_FINGERPRINT) {
     ptr = stun_message_append (msg, STUN_ATTRIBUTE_FINGERPRINT, 4);
     if (ptr == NULL) {
       return 0;
     }
 
-    fpr = stun_fingerprint (msg->buffer, stun_message_length (msg),
-        agent->compatibility == STUN_COMPATIBILITY_WLM2009);
+    fpr = stun_fingerprint (msg->buffer, stun_message_length (msg), FALSE);
     memcpy (ptr, &fpr, sizeof (fpr));
 
     stun_debug_bytes (" Message HMAC-SHA1 fingerprint: ", ptr, 4);
   }
 
 
-  if (stun_message_get_class (msg) == STUN_REQUEST) {
+  if (remember_transaction) {
     stun_message_id (msg, agent->sent_ids[saved_id_idx].id);
     agent->sent_ids[saved_id_idx].method = stun_message_get_method (msg);
     agent->sent_ids[saved_id_idx].key = (uint8_t *) key;
